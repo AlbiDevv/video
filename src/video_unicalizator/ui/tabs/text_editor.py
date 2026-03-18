@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -14,6 +14,28 @@ from video_unicalizator.ui.widgets.generation_console import GenerationConsole
 from video_unicalizator.ui.widgets.video_preview import VideoPreviewWidget
 
 LayerKey = Literal["A", "B"]
+
+
+@dataclass(slots=True)
+class LayerSectionControls:
+    key: LayerKey
+    frame: ctk.CTkFrame
+    title_label: ctk.CTkLabel
+    enabled_switch: ctk.CTkSwitch
+    sample_quote_box: ctk.CTkTextbox
+    font_combo: ctk.CTkComboBox
+    font_size_label: ctk.CTkLabel
+    font_size_slider: ctk.CTkSlider
+    box_width_label: ctk.CTkLabel
+    box_width_slider: ctk.CTkSlider
+    text_color_picker: ColorPickerRow
+    bg_color_picker: ColorPickerRow
+    bg_opacity_label: ctk.CTkLabel
+    bg_opacity_slider: ctk.CTkSlider
+    corner_radius_label: ctk.CTkLabel
+    corner_radius_slider: ctk.CTkSlider
+    shadow_label: ctk.CTkLabel
+    shadow_slider: ctk.CTkSlider
 
 
 class TextEditorTab(ctk.CTkFrame):
@@ -51,7 +73,7 @@ class TextEditorTab(ctk.CTkFrame):
         self._on_profile_changed = on_profile_changed
         self._on_overlay_changed = on_overlay_changed
         self._suspend_callbacks = False
-        self._active_layer: LayerKey = "A"
+        self._focused_layer: LayerKey = "A"
         self._current_profile = VideoEditProfile()
         self._original_paths: list[Path] = []
         self._selected_video_index = 0
@@ -64,7 +86,7 @@ class TextEditorTab(ctk.CTkFrame):
 
         self.left_panel = ctk.CTkScrollableFrame(
             self,
-            width=342,
+            width=356,
             corner_radius=18,
             fg_color="#0b1320",
             border_width=1,
@@ -73,7 +95,11 @@ class TextEditorTab(ctk.CTkFrame):
         self.left_panel.grid(row=0, column=0, padx=(12, 8), pady=(10, 8), sticky="ns")
         self.left_panel.grid_columnconfigure(0, weight=1)
 
-        self.preview = VideoPreviewWidget(self, on_overlay_change=self._handle_overlay_change)
+        self.preview = VideoPreviewWidget(
+            self,
+            on_overlay_change=self._handle_overlay_change,
+            on_overlay_focus=self._handle_overlay_focus,
+        )
         self.preview.grid(row=0, column=1, padx=8, pady=(10, 8), sticky="nsew")
 
         self.right_panel = ctk.CTkScrollableFrame(
@@ -123,7 +149,7 @@ class TextEditorTab(ctk.CTkFrame):
                 parent,
                 text=subtitle,
                 text_color="#8ea2c0",
-                wraplength=304,
+                wraplength=318,
                 justify="left",
             ).grid(row=row, column=0, padx=14, pady=(0, 8), sticky="w")
             row += 1
@@ -192,7 +218,7 @@ class TextEditorTab(ctk.CTkFrame):
             self.left_panel,
             row,
             "Ресурсы",
-            "Можно загружать по файлам или целыми папками. Для каждого видео хранятся свои положения слоёв A/B.",
+            "Можно загружать по файлам или целыми папками. Для каждого видео хранится свой макет двух независимых слоёв A/B.",
         )
 
         row, self.originals_files_button, self.originals_folder_button = self._resource_row(
@@ -253,7 +279,7 @@ class TextEditorTab(ctk.CTkFrame):
             text="output",
             text_color="#cbd5e1",
             justify="left",
-            wraplength=304,
+            wraplength=318,
         )
         self.output_label.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="w")
         row += 1
@@ -261,153 +287,10 @@ class TextEditorTab(ctk.CTkFrame):
         row = self._section_title(
             self.left_panel,
             row,
-            "Слой цитаты",
-            "Настройки ниже относятся только к активному слою. Второй слой остаётся на превью и переключается без потери макета.",
+            "Цитаты поверх кадра",
+            "Оба блока видны одновременно. Клик по цитате в превью подсвечивает её блок настроек слева.",
         )
-
-        self.layer_switch = ctk.CTkSegmentedButton(
-            self.left_panel,
-            values=["Цитата A", "Цитата B"],
-            command=self._on_layer_switched,
-            selected_color="#2563eb",
-            selected_hover_color="#1d4ed8",
-            unselected_color="#111827",
-            unselected_hover_color="#1f2937",
-        )
-        self.layer_switch.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
-        self.layer_switch.set("Цитата A")
-        row += 1
-
-        self.layer_enabled_switch = ctk.CTkSwitch(
-            self.left_panel,
-            text="Слой включён",
-            command=self._emit_profile_change,
-            progress_color="#f97316",
-        )
-        self.layer_enabled_switch.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="w")
-        row += 1
-
-        self.sample_quote_hint = ctk.CTkLabel(
-            self.left_panel,
-            text="Если txt-пул не загружен, в генерацию пойдёт этот текст. Пустой текст выключает слой.",
-            text_color="#8ea2c0",
-            wraplength=304,
-            justify="left",
-        )
-        self.sample_quote_hint.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="w")
-        row += 1
-
-        self.sample_quote_box = ctk.CTkTextbox(
-            self.left_panel,
-            height=92,
-            corner_radius=14,
-            fg_color="#09111f",
-            border_width=1,
-            border_color="#16253c",
-            wrap="word",
-            font=ctk.CTkFont(family="Segoe UI", size=13),
-        )
-        self.sample_quote_box.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
-        self.sample_quote_box.bind("<KeyRelease>", lambda _event: self._emit_profile_change())
-        row += 1
-
-        self.font_combo = ctk.CTkComboBox(
-            self.left_panel,
-            values=self._fonts,
-            height=34,
-            corner_radius=12,
-            command=lambda _value: self._emit_profile_change(),
-        )
-        self.font_combo.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
-        row += 1
-
-        self.font_size_label = ctk.CTkLabel(self.left_panel, text="Размер: 64 px", text_color="#dbe4f0")
-        self.font_size_label.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="w")
-        row += 1
-        self.font_size_slider = ctk.CTkSlider(
-            self.left_panel,
-            from_=28,
-            to=128,
-            number_of_steps=100,
-            command=self._on_font_size_changed,
-            progress_color="#f97316",
-        )
-        self.font_size_slider.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="ew")
-        row += 1
-
-        self.box_width_label = ctk.CTkLabel(self.left_panel, text="Ширина блока: 72%", text_color="#dbe4f0")
-        self.box_width_label.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="w")
-        row += 1
-        self.box_width_slider = ctk.CTkSlider(
-            self.left_panel,
-            from_=0.30,
-            to=0.90,
-            number_of_steps=60,
-            command=self._on_box_width_changed,
-            progress_color="#38bdf8",
-        )
-        self.box_width_slider.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="ew")
-        row += 1
-
-        self.text_color_picker = ColorPickerRow(
-            self.left_panel,
-            title="Цвет текста",
-            initial_color="#FFFFFF",
-            on_change=lambda _value: self._emit_profile_change(),
-        )
-        self.text_color_picker.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="ew")
-        row += 1
-
-        self.bg_color_picker = ColorPickerRow(
-            self.left_panel,
-            title="Фон цитаты",
-            initial_color="#101010",
-            on_change=lambda _value: self._emit_profile_change(),
-        )
-        self.bg_color_picker.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="ew")
-        row += 1
-
-        self.bg_opacity_label = ctk.CTkLabel(self.left_panel, text="Прозрачность: 45%", text_color="#dbe4f0")
-        self.bg_opacity_label.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="w")
-        row += 1
-        self.bg_opacity_slider = ctk.CTkSlider(
-            self.left_panel,
-            from_=0.0,
-            to=1.0,
-            number_of_steps=100,
-            command=self._on_bg_opacity_changed,
-            progress_color="#06b6d4",
-        )
-        self.bg_opacity_slider.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="ew")
-        row += 1
-
-        self.corner_radius_label = ctk.CTkLabel(self.left_panel, text="Скругление: 36 px", text_color="#dbe4f0")
-        self.corner_radius_label.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="w")
-        row += 1
-        self.corner_radius_slider = ctk.CTkSlider(
-            self.left_panel,
-            from_=8,
-            to=92,
-            number_of_steps=84,
-            command=self._on_corner_radius_changed,
-            progress_color="#a78bfa",
-        )
-        self.corner_radius_slider.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="ew")
-        row += 1
-
-        self.shadow_label = ctk.CTkLabel(self.left_panel, text="Тень: 45%", text_color="#dbe4f0")
-        self.shadow_label.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="w")
-        row += 1
-        self.shadow_slider = ctk.CTkSlider(
-            self.left_panel,
-            from_=0.0,
-            to=1.0,
-            number_of_steps=100,
-            command=self._on_shadow_changed,
-            progress_color="#f59e0b",
-        )
-        self.shadow_slider.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="ew")
-        row += 1
+        row, self.layer_sections = self._build_layer_sections(row)
 
         row = self._section_title(self.left_panel, row, "Генерация", "Эти параметры общие для всего запуска.")
 
@@ -418,6 +301,7 @@ class TextEditorTab(ctk.CTkFrame):
         )
         self.variation_label.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="w")
         row += 1
+
         self.variation_slider = ctk.CTkSlider(
             self.left_panel,
             from_=MIN_VARIATIONS,
@@ -440,7 +324,7 @@ class TextEditorTab(ctk.CTkFrame):
 
         buttons = ctk.CTkFrame(self.left_panel, fg_color="transparent")
         buttons.grid(row=row, column=0, padx=14, pady=(0, 14), sticky="ew")
-        buttons.grid_columnconfigure((0, 1, 2), weight=1)
+        buttons.grid_columnconfigure(0, weight=1)
 
         self.apply_button = ctk.CTkButton(
             buttons,
@@ -451,7 +335,7 @@ class TextEditorTab(ctk.CTkFrame):
             fg_color="#2563eb",
             hover_color="#1d4ed8",
         )
-        self.apply_button.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        self.apply_button.grid(row=0, column=0, sticky="ew")
 
         self.generate_button = ctk.CTkButton(
             buttons,
@@ -462,7 +346,7 @@ class TextEditorTab(ctk.CTkFrame):
             fg_color="#f97316",
             hover_color="#ea580c",
         )
-        self.generate_button.grid(row=0, column=1, padx=5, sticky="ew")
+        self.generate_button.grid(row=1, column=0, pady=(8, 0), sticky="ew")
 
         self.stop_generation_button = ctk.CTkButton(
             buttons,
@@ -474,7 +358,191 @@ class TextEditorTab(ctk.CTkFrame):
             hover_color="#b91c1c",
             state="disabled",
         )
-        self.stop_generation_button.grid(row=0, column=2, padx=(5, 0), sticky="ew")
+        self.stop_generation_button.grid(row=2, column=0, pady=(8, 0), sticky="ew")
+
+    def _build_layer_sections(self, row: int) -> tuple[int, dict[LayerKey, LayerSectionControls]]:
+        sections: dict[LayerKey, LayerSectionControls] = {}
+        row, sections["A"] = self._build_layer_section(
+            self.left_panel,
+            row,
+            key="A",
+            title="Цитата A",
+            accent="#2563eb",
+            subtitle="Если txt-пул A не загружен, в генерацию пойдёт этот sample-текст. Пустой текст выключает слой.",
+        )
+        row, sections["B"] = self._build_layer_section(
+            self.left_panel,
+            row,
+            key="B",
+            title="Цитата B",
+            accent="#ec4899",
+            subtitle="Второй независимый слой. Можно использовать второй txt-пул или свой fallback sample.",
+        )
+        return row, sections
+
+    def _build_layer_section(
+        self,
+        parent,
+        row: int,
+        *,
+        key: LayerKey,
+        title: str,
+        accent: str,
+        subtitle: str,
+    ) -> tuple[int, LayerSectionControls]:
+        frame = ctk.CTkFrame(
+            parent,
+            fg_color="#0f1b31",
+            corner_radius=16,
+            border_width=1,
+            border_color="#16253c",
+        )
+        frame.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
+        frame.grid_columnconfigure(0, weight=1)
+        row += 1
+
+        title_label = ctk.CTkLabel(
+            frame,
+            text=title,
+            font=ctk.CTkFont(family="Bahnschrift", size=16, weight="bold"),
+            text_color="#f8fafc",
+        )
+        title_label.grid(row=0, column=0, padx=12, pady=(12, 2), sticky="w")
+
+        ctk.CTkLabel(
+            frame,
+            text=subtitle,
+            text_color="#8ea2c0",
+            wraplength=294,
+            justify="left",
+        ).grid(row=1, column=0, padx=12, pady=(0, 8), sticky="w")
+
+        enabled_switch = ctk.CTkSwitch(
+            frame,
+            text="Слой включён",
+            command=lambda layer=key: self._handle_section_change(layer),
+            progress_color=accent,
+        )
+        enabled_switch.grid(row=2, column=0, padx=12, pady=(0, 8), sticky="w")
+
+        sample_quote_box = ctk.CTkTextbox(
+            frame,
+            height=92,
+            corner_radius=14,
+            fg_color="#09111f",
+            border_width=1,
+            border_color="#16253c",
+            wrap="word",
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+        )
+        sample_quote_box.grid(row=3, column=0, padx=12, pady=(0, 10), sticky="ew")
+        sample_quote_box.bind("<KeyRelease>", lambda _event, layer=key: self._handle_section_change(layer))
+
+        font_combo = ctk.CTkComboBox(
+            frame,
+            values=self._fonts,
+            height=34,
+            corner_radius=12,
+            command=lambda _value, layer=key: self._handle_section_change(layer),
+        )
+        font_combo.grid(row=4, column=0, padx=12, pady=(0, 10), sticky="ew")
+
+        font_size_label = ctk.CTkLabel(frame, text="Размер: 64 px", text_color="#dbe4f0")
+        font_size_label.grid(row=5, column=0, padx=12, pady=(0, 4), sticky="w")
+        font_size_slider = ctk.CTkSlider(
+            frame,
+            from_=28,
+            to=128,
+            number_of_steps=100,
+            command=lambda value, layer=key: self._on_font_size_changed(layer, value),
+            progress_color="#f97316",
+        )
+        font_size_slider.grid(row=6, column=0, padx=12, pady=(0, 8), sticky="ew")
+
+        box_width_label = ctk.CTkLabel(frame, text="Ширина блока: 72%", text_color="#dbe4f0")
+        box_width_label.grid(row=7, column=0, padx=12, pady=(0, 4), sticky="w")
+        box_width_slider = ctk.CTkSlider(
+            frame,
+            from_=0.30,
+            to=0.90,
+            number_of_steps=60,
+            command=lambda value, layer=key: self._on_box_width_changed(layer, value),
+            progress_color="#38bdf8",
+        )
+        box_width_slider.grid(row=8, column=0, padx=12, pady=(0, 8), sticky="ew")
+
+        text_color_picker = ColorPickerRow(
+            frame,
+            title="Цвет текста",
+            initial_color="#FFFFFF",
+            on_change=lambda _value, layer=key: self._handle_section_change(layer),
+        )
+        text_color_picker.grid(row=9, column=0, padx=12, pady=(0, 4), sticky="ew")
+
+        bg_color_picker = ColorPickerRow(
+            frame,
+            title="Фон цитаты",
+            initial_color="#101010",
+            on_change=lambda _value, layer=key: self._handle_section_change(layer),
+        )
+        bg_color_picker.grid(row=10, column=0, padx=12, pady=(0, 4), sticky="ew")
+
+        bg_opacity_label = ctk.CTkLabel(frame, text="Прозрачность: 45%", text_color="#dbe4f0")
+        bg_opacity_label.grid(row=11, column=0, padx=12, pady=(0, 4), sticky="w")
+        bg_opacity_slider = ctk.CTkSlider(
+            frame,
+            from_=0.0,
+            to=1.0,
+            number_of_steps=100,
+            command=lambda value, layer=key: self._on_bg_opacity_changed(layer, value),
+            progress_color="#06b6d4",
+        )
+        bg_opacity_slider.grid(row=12, column=0, padx=12, pady=(0, 8), sticky="ew")
+
+        corner_radius_label = ctk.CTkLabel(frame, text="Скругление: 36 px", text_color="#dbe4f0")
+        corner_radius_label.grid(row=13, column=0, padx=12, pady=(0, 4), sticky="w")
+        corner_radius_slider = ctk.CTkSlider(
+            frame,
+            from_=8,
+            to=92,
+            number_of_steps=84,
+            command=lambda value, layer=key: self._on_corner_radius_changed(layer, value),
+            progress_color="#a78bfa",
+        )
+        corner_radius_slider.grid(row=14, column=0, padx=12, pady=(0, 8), sticky="ew")
+
+        shadow_label = ctk.CTkLabel(frame, text="Тень: 45%", text_color="#dbe4f0")
+        shadow_label.grid(row=15, column=0, padx=12, pady=(0, 4), sticky="w")
+        shadow_slider = ctk.CTkSlider(
+            frame,
+            from_=0.0,
+            to=1.0,
+            number_of_steps=100,
+            command=lambda value, layer=key: self._on_shadow_changed(layer, value),
+            progress_color="#f59e0b",
+        )
+        shadow_slider.grid(row=16, column=0, padx=12, pady=(0, 12), sticky="ew")
+
+        return row, LayerSectionControls(
+            key=key,
+            frame=frame,
+            title_label=title_label,
+            enabled_switch=enabled_switch,
+            sample_quote_box=sample_quote_box,
+            font_combo=font_combo,
+            font_size_label=font_size_label,
+            font_size_slider=font_size_slider,
+            box_width_label=box_width_label,
+            box_width_slider=box_width_slider,
+            text_color_picker=text_color_picker,
+            bg_color_picker=bg_color_picker,
+            bg_opacity_label=bg_opacity_label,
+            bg_opacity_slider=bg_opacity_slider,
+            corner_radius_label=corner_radius_label,
+            corner_radius_slider=corner_radius_slider,
+            shadow_label=shadow_label,
+            shadow_slider=shadow_slider,
+        )
 
     def _build_right_panel(self) -> None:
         row = 0
@@ -482,7 +550,7 @@ class TextEditorTab(ctk.CTkFrame):
             self.right_panel,
             row,
             "Video Inspector",
-            "Справа теперь быстрая навигация по исходникам, состояние слоёв и лимит warning для текущего запуска.",
+            "Быстрая навигация по исходникам, состоянию слоёв и текущей папке результата.",
         )
 
         nav_frame = ctk.CTkFrame(self.right_panel, fg_color="#0f1b31", corner_radius=14)
@@ -508,7 +576,7 @@ class TextEditorTab(ctk.CTkFrame):
 
         self.layer_status = ctk.CTkLabel(
             self.right_panel,
-            text="Слои:\nA: выключен\nB: выключен",
+            text="Слои:\nA: выкл\nB: выкл",
             justify="left",
             anchor="w",
             text_color="#cbd5e1",
@@ -564,78 +632,135 @@ class TextEditorTab(ctk.CTkFrame):
         )
         self.remove_original_button.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
 
-    def _current_layer_key(self) -> LayerKey:
-        return self._active_layer
+    def _get_layer_style(self, layer: LayerKey) -> TextStyle:
+        return self._current_profile.layer_a if layer == "A" else self._current_profile.layer_b
 
-    def _current_layer_style(self) -> TextStyle:
-        return self._current_profile.layer_a if self._active_layer == "A" else self._current_profile.layer_b
-
-    def _set_current_layer_style(self, style: TextStyle) -> None:
-        if self._active_layer == "A":
+    def _set_layer_style(self, layer: LayerKey, style: TextStyle) -> None:
+        if layer == "A":
             self._current_profile.layer_a = replace(style)
         else:
             self._current_profile.layer_b = replace(style)
 
-    def _on_layer_switched(self, value: str) -> None:
-        self._persist_controls_to_profile()
-        self._active_layer = "A" if value.endswith("A") else "B"
-        self.preview.set_active_layer(self._active_layer)
-        self._load_active_layer_into_controls()
-        self._refresh_inspector()
+    def _read_section_style(self, layer: LayerKey) -> TextStyle:
+        section = self.layer_sections[layer]
+        current_style = self._get_layer_style(layer)
+        font_size = int(round(section.font_size_slider.get()))
+        text_value = section.sample_quote_box.get("1.0", "end-1c")
+        return replace(
+            current_style,
+            text_color=section.text_color_picker.get_value(),
+            background_color=section.bg_color_picker.get_value(),
+            background_opacity=float(section.bg_opacity_slider.get()),
+            shadow_strength=float(section.shadow_slider.get()),
+            font_size=font_size,
+            font_name=section.font_combo.get(),
+            preview_text=text_value,
+            box_width_ratio=float(section.box_width_slider.get()),
+            padding_x=max(18, int(round(font_size * 0.55))),
+            padding_y=max(12, int(round(font_size * 0.35))),
+            corner_radius=int(round(section.corner_radius_slider.get())),
+            text_align="center",
+            line_spacing=1.18,
+            enabled=bool(section.enabled_switch.get()),
+        )
 
-    def _persist_controls_to_profile(self) -> None:
+    def _load_layer_into_section(self, layer: LayerKey, style: TextStyle) -> None:
+        section = self.layer_sections[layer]
+        self._suspend_callbacks = True
+        if style.enabled:
+            section.enabled_switch.select()
+        else:
+            section.enabled_switch.deselect()
+        section.sample_quote_box.delete("1.0", "end")
+        section.sample_quote_box.insert("1.0", style.preview_text)
+        section.font_combo.set(style.font_name if style.font_name in self._fonts else self._fonts[0])
+        section.font_size_slider.set(style.font_size)
+        section.box_width_slider.set(style.box_width_ratio)
+        section.bg_opacity_slider.set(style.background_opacity)
+        section.corner_radius_slider.set(style.corner_radius)
+        section.shadow_slider.set(style.shadow_strength)
+        section.text_color_picker.set_value(style.text_color)
+        section.bg_color_picker.set_value(style.background_color)
+        self._update_section_labels(layer, style)
+        self._suspend_callbacks = False
+
+    def _update_section_labels(self, layer: LayerKey, style: TextStyle | None = None) -> None:
+        section = self.layer_sections[layer]
+        current = style or self._read_section_style(layer)
+        section.font_size_label.configure(text=f"Размер: {int(round(current.font_size))} px")
+        section.box_width_label.configure(text=f"Ширина блока: {int(round(current.box_width_ratio * 100))}%")
+        section.bg_opacity_label.configure(text=f"Прозрачность: {int(round(current.background_opacity * 100))}%")
+        section.corner_radius_label.configure(text=f"Скругление: {int(round(current.corner_radius))} px")
+        section.shadow_label.configure(text=f"Тень: {int(round(current.shadow_strength * 100))}%")
+
+    def _sync_layer_from_section(self, layer: LayerKey, *, update_preview: bool = True) -> TextStyle:
+        style = self._read_section_style(layer)
+        self._set_layer_style(layer, style)
+        if update_preview:
+            self.preview.update_layer(layer, style)
+        return style
+
+    def _sync_all_sections_to_profile(self) -> None:
         if self._suspend_callbacks:
             return
-        self._set_current_layer_style(self.read_active_layer_style())
-        self.preview.load_profile(self._current_profile)
+        for layer in ("A", "B"):
+            self._sync_layer_from_section(layer, update_preview=False)
 
-    def _load_active_layer_into_controls(self) -> None:
-        style = self._current_layer_style()
-        self._suspend_callbacks = True
-        self.layer_enabled_switch.select() if style.enabled else self.layer_enabled_switch.deselect()
-        self.sample_quote_box.delete("1.0", "end")
-        self.sample_quote_box.insert("1.0", style.preview_text)
-        self.font_combo.set(style.font_name if style.font_name in self._fonts else self._fonts[0])
-        self.font_size_slider.set(style.font_size)
-        self.box_width_slider.set(style.box_width_ratio)
-        self.bg_opacity_slider.set(style.background_opacity)
-        self.corner_radius_slider.set(style.corner_radius)
-        self.shadow_slider.set(style.shadow_strength)
-        self.text_color_picker.set_value(style.text_color)
-        self.bg_color_picker.set_value(style.background_color)
-        self._on_font_size_changed(style.font_size)
-        self._on_box_width_changed(style.box_width_ratio)
-        self._on_bg_opacity_changed(style.background_opacity)
-        self._on_corner_radius_changed(style.corner_radius)
-        self._on_shadow_changed(style.shadow_strength)
-        self._suspend_callbacks = False
+    def _handle_section_change(self, layer: LayerKey) -> None:
+        if self._suspend_callbacks:
+            return
+        self._focus_layer(layer)
+        style = self._sync_layer_from_section(layer)
+        self._update_section_labels(layer, style)
+        self._emit_profile_change()
 
     def _emit_profile_change(self) -> None:
         if self._suspend_callbacks:
             return
-        self._persist_controls_to_profile()
-        self._on_profile_changed(self.read_video_profile(), self.read_variation_count(), self.read_enhance_sharpness())
+        self._sync_all_sections_to_profile()
+        self.preview.load_profile(self._current_profile)
+        self.preview.set_active_layer(self._focused_layer)
+        self._on_profile_changed(self._current_profile.copy(), self.read_variation_count(), self.read_enhance_sharpness())
         self._refresh_inspector()
 
-    def _on_font_size_changed(self, value: float) -> None:
-        self.font_size_label.configure(text=f"Размер: {int(round(value))} px")
-        self._emit_profile_change()
+    def _focus_layer(self, layer: LayerKey) -> None:
+        self._focused_layer = layer
+        self.preview.set_active_layer(layer)
+        for section_layer, section in self.layer_sections.items():
+            is_active = section_layer == layer
+            border_color = "#2563eb" if section_layer == "A" else "#ec4899"
+            section.frame.configure(
+                border_color=border_color if is_active else "#16253c",
+                fg_color="#12233d" if is_active else "#0f1b31",
+            )
 
-    def _on_box_width_changed(self, value: float) -> None:
-        self.box_width_label.configure(text=f"Ширина блока: {int(round(value * 100))}%")
-        self._emit_profile_change()
+    def _handle_overlay_focus(self, layer: LayerKey) -> None:
+        self._focus_layer(layer)
 
-    def _on_bg_opacity_changed(self, value: float) -> None:
-        self.bg_opacity_label.configure(text=f"Прозрачность: {int(round(value * 100))}%")
-        self._emit_profile_change()
+    def _on_font_size_changed(self, layer: LayerKey, value: float) -> None:
+        section = self.layer_sections[layer]
+        section.font_size_label.configure(text=f"Размер: {int(round(value))} px")
+        self._handle_section_change(layer)
 
-    def _on_corner_radius_changed(self, value: float) -> None:
-        self.corner_radius_label.configure(text=f"Скругление: {int(round(value))} px")
-        self._emit_profile_change()
+    def _on_box_width_changed(self, layer: LayerKey, value: float) -> None:
+        section = self.layer_sections[layer]
+        section.box_width_label.configure(text=f"Ширина блока: {int(round(value * 100))}%")
+        self._handle_section_change(layer)
 
-    def _on_shadow_changed(self, value: float) -> None:
-        self.shadow_label.configure(text=f"Тень: {int(round(value * 100))}%")
-        self._emit_profile_change()
+    def _on_bg_opacity_changed(self, layer: LayerKey, value: float) -> None:
+        section = self.layer_sections[layer]
+        section.bg_opacity_label.configure(text=f"Прозрачность: {int(round(value * 100))}%")
+        self._handle_section_change(layer)
+
+    def _on_corner_radius_changed(self, layer: LayerKey, value: float) -> None:
+        section = self.layer_sections[layer]
+        section.corner_radius_label.configure(text=f"Скругление: {int(round(value))} px")
+        self._handle_section_change(layer)
+
+    def _on_shadow_changed(self, layer: LayerKey, value: float) -> None:
+        section = self.layer_sections[layer]
+        section.shadow_label.configure(text=f"Тень: {int(round(value * 100))}%")
+        self._handle_section_change(layer)
 
     def _on_variation_changed(self, value: float) -> None:
         self.variation_label.configure(text=f"Вариаций на оригинал: {int(round(value))}")
@@ -679,47 +804,22 @@ class TextEditorTab(ctk.CTkFrame):
         self.remove_original_button.configure(state=button_state)
 
     def _handle_overlay_change(self, layer: LayerKey, style: TextStyle) -> None:
-        if layer == "A":
-            self._current_profile.layer_a = replace(style)
-        else:
-            self._current_profile.layer_b = replace(style)
-        self._active_layer = layer
-        self.layer_switch.set(f"Цитата {layer}")
-        self._load_active_layer_into_controls()
+        self._set_layer_style(layer, style)
+        self._focus_layer(layer)
+        self._load_layer_into_section(layer, style)
         self._on_overlay_changed(layer, style)
         self._refresh_inspector()
 
     def load_profile(self, profile: VideoEditProfile) -> None:
         self._current_profile = profile.copy()
         self.preview.load_profile(self._current_profile)
-        self.preview.set_active_layer(self._active_layer)
-        self._load_active_layer_into_controls()
+        self._load_layer_into_section("A", self._current_profile.layer_a)
+        self._load_layer_into_section("B", self._current_profile.layer_b)
+        self._focus_layer(self._focused_layer)
         self._refresh_inspector()
 
-    def read_active_layer_style(self) -> TextStyle:
-        font_size = int(round(self.font_size_slider.get()))
-        text_value = self.sample_quote_box.get("1.0", "end-1c").strip()
-        return TextStyle(
-            text_color=self.text_color_picker.get_value(),
-            background_color=self.bg_color_picker.get_value(),
-            background_opacity=float(self.bg_opacity_slider.get()),
-            shadow_strength=float(self.shadow_slider.get()),
-            font_size=font_size,
-            font_name=self.font_combo.get(),
-            preview_text=text_value,
-            position_x=self._current_layer_style().position_x,
-            position_y=self._current_layer_style().position_y,
-            box_width_ratio=float(self.box_width_slider.get()),
-            line_spacing=1.18,
-            padding_x=max(18, int(round(font_size * 0.55))),
-            padding_y=max(12, int(round(font_size * 0.35))),
-            corner_radius=int(round(self.corner_radius_slider.get())),
-            text_align="center",
-            enabled=bool(self.layer_enabled_switch.get()),
-        )
-
     def read_video_profile(self) -> VideoEditProfile:
-        self._persist_controls_to_profile()
+        self._sync_all_sections_to_profile()
         return self._current_profile.copy()
 
     def read_variation_count(self) -> int:
@@ -729,17 +829,13 @@ class TextEditorTab(ctk.CTkFrame):
         return bool(self.enhance_sharpness_switch.get())
 
     def set_quote_sample(self, layer: LayerKey, quote: str) -> None:
-        if layer == "A":
-            self._current_profile.layer_a.preview_text = quote
-            if quote:
-                self._current_profile.layer_a.enabled = True
-        else:
-            self._current_profile.layer_b.preview_text = quote
-            if quote:
-                self._current_profile.layer_b.enabled = True
-        if self._active_layer == layer:
-            self._load_active_layer_into_controls()
-        self.preview.load_profile(self._current_profile)
+        style = self._get_layer_style(layer)
+        style.preview_text = quote
+        if quote.strip():
+            style.enabled = True
+        self._load_layer_into_section(layer, style)
+        self._focus_layer(layer)
+        self.preview.update_layer(layer, style)
         self._refresh_inspector()
 
     def set_originals(self, paths: list[Path], selected_path: Path | None = None) -> None:
@@ -832,24 +928,30 @@ class TextEditorTab(ctk.CTkFrame):
             self.apply_button,
             self.generate_button,
             self.remove_original_button,
-            self.font_combo,
-            self.sample_quote_box,
-            self.font_size_slider,
-            self.box_width_slider,
-            self.bg_opacity_slider,
-            self.corner_radius_slider,
-            self.shadow_slider,
             self.variation_slider,
             self.prev_video_button,
             self.next_video_button,
         ):
             widget.configure(state=state)
+
         self.listbox.configure(state=state)
-        self.layer_switch.configure(state=state)
-        self.layer_enabled_switch.configure(state=state)
         self.enhance_sharpness_switch.configure(state=state)
-        self.text_color_picker.set_enabled(enabled)
-        self.bg_color_picker.set_enabled(enabled)
+
+        for section in self.layer_sections.values():
+            for widget in (
+                section.enabled_switch,
+                section.sample_quote_box,
+                section.font_combo,
+                section.font_size_slider,
+                section.box_width_slider,
+                section.bg_opacity_slider,
+                section.corner_radius_slider,
+                section.shadow_slider,
+            ):
+                widget.configure(state=state)
+            section.text_color_picker.set_enabled(enabled)
+            section.bg_color_picker.set_enabled(enabled)
+
         self.preview.set_interaction_enabled(enabled)
         if enabled:
             self._refresh_original_actions()

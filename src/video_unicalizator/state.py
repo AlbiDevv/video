@@ -241,6 +241,8 @@ class AppState:
     color_grade: ColorGradeProfile = field(default_factory=ColorGradeProfile)
     selected_video: Path | None = None
     selected_layer: Literal["A", "B"] = "A"
+    default_layer_a_sample_text: str = DEFAULT_PREVIEW_TEXT
+    default_layer_b_sample_text: str = ""
     video_profiles: dict[str, VideoEditProfile] = field(default_factory=dict)
     generated_variations: list[GeneratedVariation] = field(default_factory=list)
     schedule_entries: list[ScheduleEntry] = field(default_factory=list)
@@ -265,24 +267,39 @@ class AppState:
     def schedules_output_dir(self, value: Path) -> None:
         self.output_dir = value
 
+    def build_default_profile(self) -> VideoEditProfile:
+        default_layer_a = replace(
+            self.text_style,
+            preview_text=(self.default_layer_a_sample_text or self.text_style.preview_text).strip() or DEFAULT_PREVIEW_TEXT,
+            enabled=True,
+        )
+        default_layer_b = QuoteLayerStyle(
+            preview_text=(self.default_layer_b_sample_text or "").strip(),
+            position_y=0.78,
+            font_size=max(28, self.text_style.font_size - 8),
+            font_name=self.text_style.font_name,
+            box_width_ratio=min(0.82, self.text_style.box_width_ratio),
+            background_color=self.text_style.background_color,
+            text_color=self.text_style.text_color,
+            background_opacity=max(0.0, self.text_style.background_opacity - 0.08),
+            shadow_strength=self.text_style.shadow_strength,
+            corner_radius=self.text_style.corner_radius,
+            enabled=bool((self.default_layer_b_sample_text or "").strip()),
+        )
+        return VideoEditProfile(layer_a=default_layer_a, layer_b=default_layer_b)
+
+    def set_default_layer_sample(self, layer: Literal["A", "B"], text: str) -> None:
+        normalized = text.strip()
+        if layer == "A":
+            self.default_layer_a_sample_text = normalized or DEFAULT_PREVIEW_TEXT
+            self.text_style.preview_text = self.default_layer_a_sample_text
+        else:
+            self.default_layer_b_sample_text = normalized
+
     def ensure_video_profile(self, video_path: Path) -> VideoEditProfile:
         key = str(video_path)
         if key not in self.video_profiles:
-            default_layer_a = replace(self.text_style)
-            default_layer_b = QuoteLayerStyle(
-                preview_text="",
-                position_y=0.78,
-                font_size=max(28, self.text_style.font_size - 8),
-                font_name=self.text_style.font_name,
-                box_width_ratio=min(0.82, self.text_style.box_width_ratio),
-                background_color=self.text_style.background_color,
-                text_color=self.text_style.text_color,
-                background_opacity=max(0.0, self.text_style.background_opacity - 0.08),
-                shadow_strength=self.text_style.shadow_strength,
-                corner_radius=self.text_style.corner_radius,
-                enabled=False,
-            )
-            self.video_profiles[key] = VideoEditProfile(layer_a=default_layer_a, layer_b=default_layer_b)
+            self.video_profiles[key] = self.build_default_profile()
         return self.video_profiles[key]
 
     def remove_original(self, video_path: Path) -> Path | None:

@@ -15,12 +15,14 @@ from video_unicalizator.utils.validation import ValidationError, validate_variat
 
 class ValidationTestCase(unittest.TestCase):
     def test_validate_variation_count_accepts_range(self) -> None:
+        self.assertEqual(validate_variation_count(2), 2)
+        self.assertEqual(validate_variation_count(9), 9)
         self.assertEqual(validate_variation_count(10), 10)
         self.assertEqual(validate_variation_count(20), 20)
 
     def test_validate_variation_count_rejects_outside_range(self) -> None:
         with self.assertRaises(ValidationError):
-            validate_variation_count(9)
+            validate_variation_count(1)
         with self.assertRaises(ValidationError):
             validate_variation_count(21)
 

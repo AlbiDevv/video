@@ -44,6 +44,28 @@ class AppStateTestCase(unittest.TestCase):
         self.assertIsNone(state.selected_video)
         self.assertEqual(state.media.original_videos, [])
 
+    def test_build_default_profile_uses_layer_sample_defaults(self) -> None:
+        state = AppState()
+        state.set_default_layer_sample("A", "Первая\nцитата")
+        state.set_default_layer_sample("B", "Вторая строка")
+
+        profile = state.build_default_profile()
+
+        self.assertEqual(profile.layer_a.preview_text, "Первая\nцитата")
+        self.assertEqual(profile.layer_b.preview_text, "Вторая строка")
+        self.assertTrue(profile.layer_a.enabled)
+        self.assertTrue(profile.layer_b.enabled)
+
+    def test_ensure_video_profile_inherits_quote_samples_loaded_before_originals(self) -> None:
+        state = AppState()
+        state.set_default_layer_sample("A", "Цитата A")
+        state.set_default_layer_sample("B", "Цитата B")
+
+        profile = state.ensure_video_profile(Path("video.mp4"))
+
+        self.assertEqual(profile.layer_a.preview_text, "Цитата A")
+        self.assertEqual(profile.layer_b.preview_text, "Цитата B")
+
 
 if __name__ == "__main__":
     unittest.main()

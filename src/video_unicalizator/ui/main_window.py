@@ -150,7 +150,7 @@ class VideoUnicalizatorApp(ctk.CTk):
     def _current_profile(self) -> VideoEditProfile:
         if self.app_state.selected_video is not None:
             return self.app_state.ensure_video_profile(self.app_state.selected_video)
-        return VideoEditProfile(layer_a=replace(self.app_state.text_style))
+        return self.app_state.build_default_profile()
 
     def _sync_ui_with_state(self) -> None:
         self.editor_view.load_profile(self._current_profile())
@@ -186,9 +186,11 @@ class VideoUnicalizatorApp(ctk.CTk):
         self.editor_view.push_generation_event(event)
 
     def _sync_selected_profile_from_editor(self) -> None:
+        profile = self.editor_view.read_video_profile()
+        self.app_state.set_default_layer_sample("A", profile.layer_a.preview_text)
+        self.app_state.set_default_layer_sample("B", profile.layer_b.preview_text)
         if self.app_state.selected_video is None:
             return
-        profile = self.editor_view.read_video_profile()
         self.app_state.video_profiles[str(self.app_state.selected_video)] = profile
         self.app_state.text_style = replace(profile.layer_a)
 
@@ -199,11 +201,11 @@ class VideoUnicalizatorApp(ctk.CTk):
     def _prime_profiles_from_quotes(self, layer: str, quote: str) -> None:
         if not quote:
             return
+        self.app_state.set_default_layer_sample(layer, quote)
         for video_path in self.app_state.media.original_videos:
             profile = self.app_state.ensure_video_profile(video_path)
             layer_style = profile.layer_a if layer == "A" else profile.layer_b
-            if not layer_style.preview_text.strip():
-                layer_style.preview_text = quote
+            layer_style.preview_text = quote
             layer_style.enabled = True
 
     def _set_originals(self, originals: list[Path], selected_video: Path | None = None) -> None:
@@ -235,8 +237,7 @@ class VideoUnicalizatorApp(ctk.CTk):
         )
         if quotes:
             self._prime_profiles_from_quotes("A", quotes[0])
-            if self.app_state.selected_video is not None:
-                self.editor_view.set_quote_sample("A", quotes[0])
+            self.editor_view.set_quote_sample("A", quotes[0])
         self._refresh_media_views()
         self._log_note(f"Загружено txt A: {len(quote_files)}")
         self._log_note(f"Загружено цитат A: {len(quotes)}")
@@ -249,8 +250,7 @@ class VideoUnicalizatorApp(ctk.CTk):
         )
         if quotes:
             self._prime_profiles_from_quotes("B", quotes[0])
-            if self.app_state.selected_video is not None:
-                self.editor_view.set_quote_sample("B", quotes[0])
+            self.editor_view.set_quote_sample("B", quotes[0])
         self._refresh_media_views()
         self._log_note(f"Загружено txt B: {len(quote_files)}")
         self._log_note(f"Загружено цитат B: {len(quotes)}")
@@ -369,11 +369,14 @@ class VideoUnicalizatorApp(ctk.CTk):
     def _handle_profile_change(self, profile: VideoEditProfile, variation_count: int, enhance_sharpness: bool) -> None:
         self.app_state.generation.variation_count = validate_variation_count(variation_count)
         self.app_state.generation.enhance_sharpness = enhance_sharpness
+        self.app_state.set_default_layer_sample("A", profile.layer_a.preview_text)
+        self.app_state.set_default_layer_sample("B", profile.layer_b.preview_text)
         if self.app_state.selected_video is not None:
             self.app_state.video_profiles[str(self.app_state.selected_video)] = profile.copy()
             self.app_state.text_style = replace(profile.layer_a)
 
     def _handle_overlay_change(self, layer: str, style: TextStyle) -> None:
+        self.app_state.set_default_layer_sample(layer, style.preview_text)
         if self.app_state.selected_video is None:
             return
         profile = self.app_state.ensure_video_profile(self.app_state.selected_video)

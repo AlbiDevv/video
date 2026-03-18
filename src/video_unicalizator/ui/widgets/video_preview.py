@@ -21,7 +21,7 @@ LayerKey = Literal["A", "B"]
 class VideoPreviewWidget(ctk.CTkFrame):
     """Превью выбранного ролика с двумя редактируемыми слоями цитат."""
 
-    def __init__(self, master, on_overlay_change, **kwargs) -> None:
+    def __init__(self, master, on_overlay_change, on_overlay_focus=None, **kwargs) -> None:
         super().__init__(
             master,
             fg_color="#0d1729",
@@ -33,11 +33,12 @@ class VideoPreviewWidget(ctk.CTkFrame):
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
         self._on_overlay_change = on_overlay_change
+        self._on_overlay_focus = on_overlay_focus or (lambda _layer: None)
         self.logger = logging.getLogger(self.__class__.__name__)
 
         toolbar = ctk.CTkFrame(self, fg_color="transparent")
         toolbar.grid(row=0, column=0, padx=14, pady=(10, 8), sticky="ew")
-        toolbar.grid_columnconfigure(1, weight=1)
+        toolbar.grid_columnconfigure(0, weight=1)
 
         self.title_label = ctk.CTkLabel(
             toolbar,
@@ -47,20 +48,8 @@ class VideoPreviewWidget(ctk.CTkFrame):
         )
         self.title_label.grid(row=0, column=0, sticky="w")
 
-        self.layer_badges = ctk.CTkSegmentedButton(
-            toolbar,
-            values=["Цитата A", "Цитата B"],
-            command=self._handle_layer_badge,
-            selected_color="#2563eb",
-            selected_hover_color="#1d4ed8",
-            unselected_color="#16253c",
-            unselected_hover_color="#1d3557",
-        )
-        self.layer_badges.grid(row=0, column=1, padx=(18, 10), sticky="w")
-        self.layer_badges.set("Цитата A")
-
         controls = ctk.CTkFrame(toolbar, fg_color="transparent")
-        controls.grid(row=0, column=2, sticky="e")
+        controls.grid(row=0, column=1, sticky="e")
 
         self.zoom_out_button = ctk.CTkButton(
             controls,
@@ -130,7 +119,7 @@ class VideoPreviewWidget(ctk.CTkFrame):
 
         self.status_label = ctk.CTkLabel(
             self,
-            text="Переключайте видео справа, колесом масштабируйте кадр, drag по цитате двигает слой.",
+            text="Клик по цитате выбирает слой, drag двигает его, колесо мыши масштабирует кадр.",
             text_color="#94a3b8",
             anchor="w",
             justify="left",
@@ -171,12 +160,8 @@ class VideoPreviewWidget(ctk.CTkFrame):
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         self._draw_placeholder()
 
-    def _handle_layer_badge(self, value: str) -> None:
-        self.set_active_layer("A" if value.endswith("A") else "B")
-
     def set_active_layer(self, layer: LayerKey) -> None:
         self._active_layer = layer
-        self.layer_badges.set(f"Цитата {layer}")
         self._refresh_overlays()
 
     def load_profile(self, profile: VideoEditProfile) -> None:
@@ -191,6 +176,8 @@ class VideoPreviewWidget(ctk.CTkFrame):
         self._refresh_overlays()
 
     def _refresh_overlays(self) -> None:
+        self._overlay_a.set_highlighted(self._active_layer == "A")
+        self._overlay_b.set_highlighted(self._active_layer == "B")
         self._overlay_a.update_scene(self._profile.layer_a, self._profile.layer_a.preview_text, self._viewport)
         self._overlay_b.update_scene(self._profile.layer_b, self._profile.layer_b.preview_text, self._viewport)
         if self._active_layer == "A":
@@ -222,6 +209,7 @@ class VideoPreviewWidget(ctk.CTkFrame):
             self._drag_mode = "overlay"
             self._active_overlay_id = layer
             self.set_active_layer(layer)
+            self._on_overlay_focus(layer)
             return True
         return False
 
@@ -448,7 +436,6 @@ class VideoPreviewWidget(ctk.CTkFrame):
             self.stop_button,
         ):
             button.configure(state=button_state)
-        self.layer_badges.configure(state=button_state)
         if not enabled:
             self.stop()
             self._drag_mode = None

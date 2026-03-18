@@ -27,6 +27,7 @@ class DraggableTextOverlay:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.style = TextStyle()
         self.preview_text = self.style.preview_text
+        self._highlighted = False
 
         self._viewport = (0, 0, 1, 1)
         self._video_size = (TARGET_WIDTH, TARGET_HEIGHT)
@@ -59,6 +60,12 @@ class DraggableTextOverlay:
 
     def is_interacting(self) -> bool:
         return self._active_mode is not None
+
+    def set_highlighted(self, highlighted: bool) -> None:
+        if self._highlighted == highlighted:
+            return
+        self._highlighted = highlighted
+        self._update_highlight_state()
 
     def contains_canvas_point(self, canvas_x: int, canvas_y: int) -> bool:
         handle = self._handle_hit_test(canvas_x, canvas_y)
@@ -294,11 +301,8 @@ class DraggableTextOverlay:
                 width=2,
                 dash=(6, 3),
             )
-        self.canvas.itemconfigure(self._selection_item, state="normal")
 
         if self._handle_items:
-            for item in self._handle_items.values():
-                self.canvas.itemconfigure(item, state="normal")
             return
 
         for handle_name in ("nw", "ne", "sw", "se", "w", "e"):
@@ -336,6 +340,15 @@ class DraggableTextOverlay:
             center_x, center_y = positions[handle_name]
             self.canvas.itemconfigure(item, state="normal")
             self.canvas.coords(item, center_x - half, center_y - half, center_x + half, center_y + half)
+        self._update_highlight_state()
+
+    def _update_highlight_state(self) -> None:
+        visible = self._highlighted or self._active_mode is not None
+        state = "normal" if visible else "hidden"
+        if self._selection_item is not None:
+            self.canvas.itemconfigure(self._selection_item, state=state)
+        for item in self._handle_items.values():
+            self.canvas.itemconfigure(item, state=state)
 
     def _handle_hit_test(self, canvas_x: int, canvas_y: int) -> str | None:
         bounds = self._current_canvas_bounds()
