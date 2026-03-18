@@ -49,9 +49,11 @@ class DraggableTextOverlay:
         self._start_pointer_video = (0.0, 0.0)
 
     def update_scene(self, style: TextStyle, preview_text: str, viewport: tuple[int, int, int, int]) -> None:
-        self.style = replace(style)
         self.preview_text = preview_text
         self._viewport = viewport
+        if self._active_mode is not None:
+            return
+        self.style = replace(style)
         if self._active_mode is None:
             self._render(force=False)
 

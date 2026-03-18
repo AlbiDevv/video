@@ -52,6 +52,32 @@ class VideoPreviewIntegrationTestCase(unittest.TestCase):
         self.assertNotEqual(widget._profile.layer_a.position_x, old_a_x)
         self.assertNotEqual(widget._profile.layer_b.position_x, old_b_x)
 
+    def test_full_mouse_drag_path_does_not_snap_back_on_release(self) -> None:
+        app = ctk.CTk()
+        self.addCleanup(app.destroy)
+        app.geometry("1200x900")
+
+        widget = VideoPreviewWidget(app, on_overlay_change=lambda _layer, _style: None)
+        widget.pack(fill="both", expand=True)
+
+        profile = VideoEditProfile()
+        profile.layer_a.preview_text = "Layer A"
+        profile.layer_a.enabled = True
+        widget.load_profile(profile)
+
+        app.update_idletasks()
+        app.update()
+
+        start_bounds = widget._overlay_a._current_canvas_bounds()
+        old_x = widget._profile.layer_a.position_x
+
+        event = lambda x, y: type("Event", (), {"x": x, "y": y})()
+        widget._on_canvas_press(event(start_bounds.center_x, start_bounds.center_y))
+        widget._on_canvas_drag(event(start_bounds.center_x + 70, start_bounds.center_y))
+        widget._on_canvas_release(event(start_bounds.center_x + 70, start_bounds.center_y))
+
+        self.assertNotEqual(widget._profile.layer_a.position_x, old_x)
+
 
 if __name__ == "__main__":
     unittest.main()
