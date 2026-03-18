@@ -36,6 +36,28 @@ class TextOverlayRendererTestCase(unittest.TestCase):
         self.assertLessEqual(len(wide_renderer.text_lines), len(narrow_renderer.text_lines))
         self.assertLess(narrow_renderer.bounds.width, wide_renderer.bounds.width)
 
+    def test_long_quote_keeps_top_anchor_for_upper_position(self) -> None:
+        sample = "Короткая цитата"
+        long_quote = "Это намного более длинная цитата для проверки того, что верхняя граница блока не уезжает выше выбранного места"
+        style = TextStyle(font_name="Segoe UI", preview_text=sample, box_width_ratio=0.62, position_y=0.16)
+
+        sample_renderer = TextOverlayRenderer(OverlayLayout(width=1080, height=1920), style, sample)
+        long_renderer = TextOverlayRenderer(OverlayLayout(width=1080, height=1920), style, long_quote)
+
+        self.assertEqual(sample_renderer.bounds.top, long_renderer.bounds.top)
+        self.assertGreaterEqual(long_renderer.bounds.bottom, sample_renderer.bounds.bottom)
+
+    def test_long_quote_keeps_bottom_anchor_for_lower_position(self) -> None:
+        sample = "Короткая цитата"
+        long_quote = "Это намного более длинная цитата для проверки того, что нижняя граница блока не уезжает ниже выбранного места"
+        style = TextStyle(font_name="Segoe UI", preview_text=sample, box_width_ratio=0.62, position_y=0.82)
+
+        sample_renderer = TextOverlayRenderer(OverlayLayout(width=1080, height=1920), style, sample)
+        long_renderer = TextOverlayRenderer(OverlayLayout(width=1080, height=1920), style, long_quote)
+
+        self.assertEqual(sample_renderer.bounds.bottom, long_renderer.bounds.bottom)
+        self.assertLessEqual(long_renderer.bounds.top, sample_renderer.bounds.top)
+
 
 if __name__ == "__main__":
     unittest.main()

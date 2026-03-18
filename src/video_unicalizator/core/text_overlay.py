@@ -408,6 +408,72 @@ class TextOverlayRenderer:
     def _shadow_opacity(self) -> int:
         return int(round(255 * min(0.78, 0.20 + self.style.shadow_strength * 0.58)))
 
+    def _target_block_width(self, padding_x: int) -> int:
+        requested_width = int(round(self.layout.width * self.style.box_width_ratio))
+        minimum_width = max(120 + padding_x * 2, 1)
+        return min(self.layout.width, max(minimum_width, requested_width))
+
+    def _measure_quote_block(
+        self,
+        quote: str,
+        *,
+        block_width: int,
+        font_size: int,
+        padding_x: int,
+        padding_y: int,
+    ) -> tuple[list[str], list[TextLine], int, int]:
+        max_text_width = max(32, block_width - padding_x * 2)
+        wrapped_lines = _wrap_text(quote, max_text_width, self.style.font_name, font_size)
+        text_lines = _build_text_lines(wrapped_lines, self.style.font_name, font_size)
+
+        line_gap = max(0, int(round(font_size * max(0.0, self.style.line_spacing - 1.0))))
+        text_height = 0
+        for index, line in enumerate(text_lines):
+            text_height += line.height
+            if index < len(text_lines) - 1:
+                text_height += line_gap
+
+        block_height = min(self.layout.height, max(1, text_height + padding_y * 2))
+        return wrapped_lines, text_lines, line_gap, block_height
+
+    def _place_centered_bounds(self, block_width: int, block_height: int) -> OverlayBounds:
+        center_x = _clamp(self.layout.width * self.style.position_x, block_width / 2, self.layout.width - block_width / 2)
+        center_y = _clamp(
+            self.layout.height * self.style.position_y,
+            block_height / 2,
+            self.layout.height - block_height / 2,
+        )
+        x1 = int(round(center_x - block_width / 2))
+        y1 = int(round(center_y - block_height / 2))
+        return OverlayBounds(left=x1, top=y1, right=x1 + block_width, bottom=y1 + block_height)
+
+    def _place_bounds_from_reference(self, reference_bounds: OverlayBounds, block_width: int, block_height: int) -> OverlayBounds:
+        reference_center_x = reference_bounds.center_x
+        reference_center_y = reference_bounds.center_y
+
+        if reference_center_x <= self.layout.width * 0.35:
+            x1 = float(reference_bounds.left)
+        elif reference_center_x >= self.layout.width * 0.65:
+            x1 = float(reference_bounds.right - block_width)
+        else:
+            x1 = float(reference_center_x - block_width / 2)
+
+        if reference_center_y <= self.layout.height * 0.35:
+            y1 = float(reference_bounds.top)
+        elif reference_center_y >= self.layout.height * 0.65:
+            y1 = float(reference_bounds.bottom - block_height)
+        else:
+            y1 = float(reference_center_y - block_height / 2)
+
+        x1 = _clamp(x1, 0, self.layout.width - block_width)
+        y1 = _clamp(y1, 0, self.layout.height - block_height)
+        return OverlayBounds(
+            left=int(round(x1)),
+            top=int(round(y1)),
+            right=int(round(x1 + block_width)),
+            bottom=int(round(y1 + block_height)),
+        )
+
     def _build_overlay(self) -> OverlayRenderResult:
         image = Image.new("RGBA", (self.layout.width, self.layout.height), (0, 0, 0, 0))
         if not self.quote:
@@ -416,29 +482,26 @@ class TextOverlayRenderer:
         font_size = self._scaled_font_size()
         padding_x = self._scaled_padding_x()
         padding_y = self._scaled_padding_y()
-        max_text_width = max(120, int(self.layout.width * self.style.box_width_ratio) - padding_x * 2)
-        wrapped_lines = _wrap_text(self.quote, max_text_width, self.style.font_name, font_size)
-        text_lines = _build_text_lines(wrapped_lines, self.style.font_name, font_size)
+        block_width = self._target_block_width(padding_x)
+        reference_quote = self.style.preview_text.strip() or self.quote
+        _, _, _, reference_height = self._measure_quote_block(
+            reference_quote,
+            block_width=block_width,
+            font_size=font_size,
+            padding_x=padding_x,
+            padding_y=padding_y,
+        )
+        wrapped_lines, text_lines, line_gap, block_height = self._measure_quote_block(
+            self.quote,
+            block_width=block_width,
+            font_size=font_size,
+            padding_x=padding_x,
+            padding_y=padding_y,
+        )
 
-        text_width = max((line.width for line in text_lines), default=0)
-        line_gap = max(0, int(round(font_size * max(0.0, self.style.line_spacing - 1.0))))
-        text_height = 0
-        for index, line in enumerate(text_lines):
-            text_height += line.height
-            if index < len(text_lines) - 1:
-                text_height += line_gap
-
-        block_width = min(self.layout.width, max(1, text_width + padding_x * 2))
-        block_height = min(self.layout.height, max(1, text_height + padding_y * 2))
-
-        center_x = _clamp(self.layout.width * self.style.position_x, block_width / 2, self.layout.width - block_width / 2)
-        center_y = _clamp(self.layout.height * self.style.position_y, block_height / 2, self.layout.height - block_height / 2)
-
-        x1 = int(round(center_x - block_width / 2))
-        y1 = int(round(center_y - block_height / 2))
-        x2 = x1 + block_width
-        y2 = y1 + block_height
-        bounds = OverlayBounds(left=x1, top=y1, right=x2, bottom=y2)
+        reference_bounds = self._place_centered_bounds(block_width, reference_height)
+        bounds = self._place_bounds_from_reference(reference_bounds, block_width, block_height)
+        x1, y1, x2, y2 = bounds.left, bounds.top, bounds.right, bounds.bottom
 
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle(
