@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-unicalizator"
+version = "0.1.0"
+description = "Desktop-приложение для генерации вариаций вертикальных видео"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "customtkinter>=5.2.2",
+  "moviepy>=2.1.2",
+  "ffmpeg-python>=0.2.0",
+  "opencv-python>=4.10.0.84",
+  "pillow>=11.0.0",
+  "pandas>=2.2.3",
+  "openpyxl>=3.1.5",
+]
+
+[project.scripts]
+video-unicalizator = "video_unicalizator.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
