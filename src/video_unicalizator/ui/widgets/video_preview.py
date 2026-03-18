@@ -1,20 +1,25 @@
 from __future__ import annotations
 
+import logging
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 import customtkinter as ctk
 import cv2
 from PIL import Image, ImageTk
 
 from video_unicalizator.config import PREVIEW_MAX_ZOOM, PREVIEW_MIN_ZOOM, PREVIEW_ZOOM_STEP, TARGET_HEIGHT, TARGET_WIDTH
-from video_unicalizator.state import TextStyle
+from video_unicalizator.state import TextStyle, VideoEditProfile
 from video_unicalizator.ui.widgets.draggable_text import DraggableTextOverlay
 from video_unicalizator.utils.image_tools import fit_cover_frame
 
+LayerKey = Literal["A", "B"]
+
 
 class VideoPreviewWidget(ctk.CTkFrame):
-    """Превью и плеер выбранного ролика с zoom/pan и интерактивной цитатой."""
+    """Превью выбранного ролика с двумя редактируемыми слоями цитат."""
 
     def __init__(self, master, on_overlay_change, **kwargs) -> None:
         super().__init__(
@@ -27,6 +32,8 @@ class VideoPreviewWidget(ctk.CTkFrame):
         )
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
+        self._on_overlay_change = on_overlay_change
+        self.logger = logging.getLogger(self.__class__.__name__)
 
         toolbar = ctk.CTkFrame(self, fg_color="transparent")
         toolbar.grid(row=0, column=0, padx=14, pady=(10, 8), sticky="ew")
@@ -39,6 +46,18 @@ class VideoPreviewWidget(ctk.CTkFrame):
             text_color="#f8fafc",
         )
         self.title_label.grid(row=0, column=0, sticky="w")
+
+        self.layer_badges = ctk.CTkSegmentedButton(
+            toolbar,
+            values=["Цитата A", "Цитата B"],
+            command=self._handle_layer_badge,
+            selected_color="#2563eb",
+            selected_hover_color="#1d4ed8",
+            unselected_color="#16253c",
+            unselected_hover_color="#1d3557",
+        )
+        self.layer_badges.grid(row=0, column=1, padx=(18, 10), sticky="w")
+        self.layer_badges.set("Цитата A")
 
         controls = ctk.CTkFrame(toolbar, fg_color="transparent")
         controls.grid(row=0, column=2, sticky="e")
@@ -111,7 +130,7 @@ class VideoPreviewWidget(ctk.CTkFrame):
 
         self.status_label = ctk.CTkLabel(
             self,
-            text="Колесо мыши приближает, drag по пустому кадру панорамирует, drag по цитате редактирует её.",
+            text="Переключайте видео справа, колесом масштабируйте кадр, drag по цитате двигает слой.",
             text_color="#94a3b8",
             anchor="w",
             justify="left",
@@ -126,12 +145,8 @@ class VideoPreviewWidget(ctk.CTkFrame):
         self._fps = 30.0
         self._video_path: Path | None = None
         self._current_frame_rgb = None
-        self._base_status_text = "Колесо мыши приближает, drag по пустому кадру панорамирует, drag по цитате редактирует её."
+        self._base_status_text = self.status_label.cget("text")
         self._resume_playback_after_interaction = False
-
-        self._style = TextStyle()
-        self._preview_text = self._style.preview_text
-        self._overlay = DraggableTextOverlay(self.canvas, on_overlay_change)
 
         self._zoom_factor = 1.0
         self._pan_x = 0.0
@@ -139,9 +154,15 @@ class VideoPreviewWidget(ctk.CTkFrame):
         self._viewport = (0, 0, 1, 1)
         self._interaction_enabled = True
 
+        self._active_layer: LayerKey = "A"
+        self._active_overlay_id: LayerKey | None = None
         self._drag_mode: str | None = None
         self._drag_start = (0, 0)
         self._pan_start = (0.0, 0.0)
+
+        self._profile = VideoEditProfile()
+        self._overlay_a = DraggableTextOverlay(self.canvas, lambda style: self._handle_overlay_change("A", style))
+        self._overlay_b = DraggableTextOverlay(self.canvas, lambda style: self._handle_overlay_change("B", style))
 
         self.canvas.bind("<Configure>", self._on_canvas_resized)
         self.canvas.bind("<ButtonPress-1>", self._on_canvas_press)
@@ -150,16 +171,68 @@ class VideoPreviewWidget(ctk.CTkFrame):
         self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         self._draw_placeholder()
 
+    def _handle_layer_badge(self, value: str) -> None:
+        self.set_active_layer("A" if value.endswith("A") else "B")
+
+    def set_active_layer(self, layer: LayerKey) -> None:
+        self._active_layer = layer
+        self.layer_badges.set(f"Цитата {layer}")
+        self._refresh_overlays()
+
+    def load_profile(self, profile: VideoEditProfile) -> None:
+        self._profile = profile.copy()
+        self._refresh_overlays()
+
+    def update_layer(self, layer: LayerKey, style: TextStyle) -> None:
+        if layer == "A":
+            self._profile.layer_a = replace(style)
+        else:
+            self._profile.layer_b = replace(style)
+        self._refresh_overlays()
+
+    def _refresh_overlays(self) -> None:
+        self._overlay_a.update_scene(self._profile.layer_a, self._profile.layer_a.preview_text, self._viewport)
+        self._overlay_b.update_scene(self._profile.layer_b, self._profile.layer_b.preview_text, self._viewport)
+        if self._active_layer == "A":
+            self._overlay_b.lift()
+            self._overlay_a.lift()
+        else:
+            self._overlay_a.lift()
+            self._overlay_b.lift()
+
+    def _handle_overlay_change(self, layer: LayerKey, style: TextStyle) -> None:
+        try:
+            if layer == "A":
+                self._profile.layer_a = replace(style)
+            else:
+                self._profile.layer_b = replace(style)
+            self.set_active_layer(layer)
+            self._on_overlay_change(layer, style)
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed to apply overlay changes for layer %s", layer)
+            self.set_runtime_status("Ошибка обновления цитаты. Последнее изменение не применено.")
+
     def _on_canvas_resized(self, _event) -> None:
         self._refresh_scene()
+
+    def _try_start_overlay(self, layer: LayerKey, event) -> bool:
+        overlay = self._overlay_a if layer == "A" else self._overlay_b
+        if overlay.start_interaction(event.x, event.y):
+            self._pause_for_overlay_interaction()
+            self._drag_mode = "overlay"
+            self._active_overlay_id = layer
+            self.set_active_layer(layer)
+            return True
+        return False
 
     def _on_canvas_press(self, event) -> None:
         if not self._interaction_enabled:
             return
-        if self._overlay.start_interaction(event.x, event.y):
-            self._pause_for_overlay_interaction()
-            self._drag_mode = "overlay"
-            return
+
+        overlay_order = [self._active_layer, "B" if self._active_layer == "A" else "A"]
+        for layer in overlay_order:
+            if self._try_start_overlay(layer, event):
+                return
 
         if self._zoom_factor > 1.0 and self._point_inside_viewport(event.x, event.y):
             self._drag_mode = "pan"
@@ -173,9 +246,10 @@ class VideoPreviewWidget(ctk.CTkFrame):
     def _on_canvas_drag(self, event) -> None:
         if not self._interaction_enabled:
             return
-        if self._drag_mode == "overlay":
-            if self._overlay.drag_to(event.x, event.y):
-                self._overlay.lift()
+        if self._drag_mode == "overlay" and self._active_overlay_id is not None:
+            overlay = self._overlay_a if self._active_overlay_id == "A" else self._overlay_b
+            if overlay.drag_to(event.x, event.y):
+                self._refresh_overlays()
             return
 
         if self._drag_mode == "pan":
@@ -190,10 +264,13 @@ class VideoPreviewWidget(ctk.CTkFrame):
             self._drag_mode = None
             self.canvas.configure(cursor="")
             return
-        if self._drag_mode == "overlay":
-            self._overlay.finish_interaction()
+        if self._drag_mode == "overlay" and self._active_overlay_id is not None:
+            overlay = self._overlay_a if self._active_overlay_id == "A" else self._overlay_b
+            overlay.finish_interaction()
+            self._refresh_overlays()
             self._resume_after_overlay_interaction()
         self._drag_mode = None
+        self._active_overlay_id = None
         self.canvas.configure(cursor="")
 
     def _on_mouse_wheel(self, event) -> None:
@@ -235,14 +312,6 @@ class VideoPreviewWidget(ctk.CTkFrame):
         self._base_status_text = video_path.name
         self.status_label.configure(text=self._base_status_text)
         self._render_current_frame()
-
-    def update_style(self, style: TextStyle) -> None:
-        self._style = style
-        self._overlay.update_scene(style, self._preview_text, self._viewport)
-
-    def update_preview_text(self, text: str) -> None:
-        self._preview_text = text
-        self._overlay.update_scene(self._style, self._preview_text, self._viewport)
 
     def toggle_playback(self) -> None:
         if self._capture is None or not self._interaction_enabled:
@@ -306,8 +375,7 @@ class VideoPreviewWidget(ctk.CTkFrame):
                 self.canvas.itemconfigure(self._frame_item, image=self._photo_image)
                 self.canvas.coords(self._frame_item, viewport_x, viewport_y)
 
-        self._overlay.update_scene(self._style, self._preview_text, self._viewport)
-        self._overlay.lift()
+        self._refresh_overlays()
 
     def _draw_placeholder(self) -> None:
         canvas_width = max(320, self.canvas.winfo_width() or 405)
@@ -322,7 +390,7 @@ class VideoPreviewWidget(ctk.CTkFrame):
         else:
             self.canvas.itemconfigure(self._frame_item, image=self._photo_image)
             self.canvas.coords(self._frame_item, viewport_x, viewport_y)
-        self._overlay.update_scene(self._style, self._preview_text, self._viewport)
+        self._refresh_overlays()
 
     def _compute_viewport(self, canvas_width: int, canvas_height: int) -> tuple[int, int, int, int]:
         fit_scale = min(canvas_width / TARGET_WIDTH, canvas_height / TARGET_HEIGHT)
@@ -353,10 +421,7 @@ class VideoPreviewWidget(ctk.CTkFrame):
 
     def _point_inside_viewport(self, canvas_x: int, canvas_y: int) -> bool:
         viewport_x, viewport_y, viewport_width, viewport_height = self._viewport
-        return (
-            viewport_x <= canvas_x <= viewport_x + viewport_width
-            and viewport_y <= canvas_y <= viewport_y + viewport_height
-        )
+        return viewport_x <= canvas_x <= viewport_x + viewport_width and viewport_y <= canvas_y <= viewport_y + viewport_height
 
     def _release_capture(self) -> None:
         if self._capture is not None:
@@ -383,9 +448,11 @@ class VideoPreviewWidget(ctk.CTkFrame):
             self.stop_button,
         ):
             button.configure(state=button_state)
+        self.layer_badges.configure(state=button_state)
         if not enabled:
             self.stop()
             self._drag_mode = None
+            self._active_overlay_id = None
             self.canvas.configure(cursor="")
 
     def _pause_for_overlay_interaction(self) -> None:

@@ -46,10 +46,18 @@ def merge_media_library(
     music: list[Path] | None = None,
     quote_files: list[Path] | None = None,
     quotes: list[str] | None = None,
+    quote_files_a: list[Path] | None = None,
+    quote_files_b: list[Path] | None = None,
+    quotes_a: list[str] | None = None,
+    quotes_b: list[str] | None = None,
 ) -> MediaLibrary:
+    legacy_quote_files_a = quote_files if quote_files_a is None and quote_files is not None else quote_files_a
+    legacy_quotes_a = quotes if quotes_a is None and quotes is not None else quotes_a
     return MediaLibrary(
         original_videos=originals if originals is not None else list(current.original_videos),
         music_tracks=music if music is not None else list(current.music_tracks),
-        quote_files=quote_files if quote_files is not None else list(current.quote_files),
-        quotes=quotes if quotes is not None else list(current.quotes),
+        quote_files_a=legacy_quote_files_a if legacy_quote_files_a is not None else list(current.quote_files_a),
+        quote_files_b=quote_files_b if quote_files_b is not None else list(current.quote_files_b),
+        quotes_a=legacy_quotes_a if legacy_quotes_a is not None else list(current.quotes_a),
+        quotes_b=quotes_b if quotes_b is not None else list(current.quotes_b),
     )

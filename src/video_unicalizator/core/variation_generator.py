@@ -1,20 +1,46 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from video_unicalizator.config import SPEED_MAX, SPEED_MIN
+from video_unicalizator.config import MIN_SHARPNESS_SCORE
 from video_unicalizator.core.quality_checker import QualityChecker, QualityReference, QualityReport
+from video_unicalizator.core.recipe_planner import (
+    PlannedRecipeCandidate,
+    SourceUniquenessLedger,
+    VariationRecipePlanner,
+)
 from video_unicalizator.core.video_processor import VariationProfile, VideoProcessor
-from video_unicalizator.services.music_loader import MusicRotation
-from video_unicalizator.state import AppState, GeneratedVariation, GenerationProgressEvent, GenerationSettings
+from video_unicalizator.services.music_loader import MusicChoice, MusicRotation
+from video_unicalizator.state import (
+    AppState,
+    GeneratedVariation,
+    GenerationCancelToken,
+    GenerationCancelledError,
+    GenerationProgressEvent,
+    GenerationSettings,
+    VideoEditProfile,
+)
 from video_unicalizator.utils.ffmpeg_tools import ffmpeg_available
 from video_unicalizator.utils.validation import ValidationError
 
 ProgressCallback = Callable[[GenerationProgressEvent], None]
+
+
+class UniquenessExhaustedError(RuntimeError):
+    pass
+
+
+class QualityGateFailure(RuntimeError):
+    pass
+
+
+class RenderFailure(RuntimeError):
+    pass
 
 
 @dataclass(slots=True)
@@ -22,7 +48,8 @@ class RenderAttempt:
     output_video: Path
     profile: VariationProfile
     report: QualityReport
-    quote: str
+    primary_quote: str
+    secondary_quote: str
     music_track: Path | None
     snapshot: QualityReference | None
     soft_accepted: bool = False
@@ -33,6 +60,7 @@ class FailedVariation:
     source_video: Path
     variation_index: int
     reason: str
+    reason_code: str = "other"
 
 
 @dataclass(slots=True)
@@ -41,6 +69,11 @@ class GenerationRunSummary:
     success_count: int = 0
     warning_count: int = 0
     soft_accepted_count: int = 0
+    skipped_uniqueness_count: int = 0
+    failed_quality_count: int = 0
+    failed_render_count: int = 0
+    cancelled: bool = False
+    cancelled_message: str = ""
     failed_variations: list[FailedVariation] = field(default_factory=list)
 
     @property
@@ -49,8 +82,6 @@ class GenerationRunSummary:
 
 
 class VariationGenerator:
-    """Управляет пакетом вариаций и quality gate."""
-
     def __init__(self) -> None:
         self.video_processor = VideoProcessor()
         self.quality_checker = QualityChecker()
@@ -101,19 +132,25 @@ class VariationGenerator:
         suffix = f"_attempt_{attempt_number}" if attempt_number is not None else ""
         return output_dir / f"{source_video.stem}_variation_{variation_index:02d}{suffix}.mp4"
 
-    def _resolve_quotes(self, state: AppState) -> list[str]:
-        if state.media.quotes:
-            return list(state.media.quotes)
-        fallback = state.text_style.preview_text.strip()
-        if fallback:
-            return [fallback]
-        return []
-
     def _validate_state(self, state: AppState) -> None:
         if not ffmpeg_available():
             raise ValidationError("FFmpeg не найден в PATH. Обработка видео недоступна.")
         if not state.media.original_videos:
             raise ValidationError("Сначала загрузите оригинальные mp4.")
+
+    def _check_cancel(self, cancel_token: GenerationCancelToken | None) -> None:
+        if cancel_token is not None:
+            cancel_token.throw_if_cancelled()
+
+    def _mark_cancelled(
+        self,
+        callback: ProgressCallback | None,
+        progress: float,
+        message: str = "Генерация остановлена по запросу пользователя.",
+    ) -> None:
+        self.last_summary.cancelled = True
+        self.last_summary.cancelled_message = message
+        self._notify(callback, "Остановлено", message, progress, level="warning")
 
     def _finalize_output(self, attempt_output: Path, final_output: Path) -> Path:
         if final_output.exists():
@@ -122,8 +159,80 @@ class VariationGenerator:
             attempt_output.replace(final_output)
         return final_output
 
+    def _video_profile_for(self, state: AppState, source_video: Path) -> VideoEditProfile:
+        return state.ensure_video_profile(source_video)
+
+    def _resolve_quote_pool(self, quotes: list[str], fallback_text: str, enabled: bool) -> list[str]:
+        if not enabled:
+            return []
+        if quotes:
+            return list(quotes)
+        fallback = fallback_text.strip()
+        return [fallback] if fallback else []
+
+    def _resolve_quote_pools(self, state: AppState, profile: VideoEditProfile) -> tuple[list[str], list[str]]:
+        return (
+            self._resolve_quote_pool(state.media.quotes_a, profile.layer_a.preview_text, profile.layer_a.enabled),
+            self._resolve_quote_pool(state.media.quotes_b, profile.layer_b.preview_text, profile.layer_b.enabled),
+        )
+
+    def _warning_reason_codes(self, warnings: list[str]) -> list[str]:
+        codes: list[str] = []
+        for warning in warnings:
+            lowered = warning.lower()
+            if "формат" in lowered:
+                codes.append("format")
+            elif "резкость" in lowered:
+                codes.append("sharpness")
+            elif "длительность" in lowered:
+                codes.append("duration")
+            elif "визуальная" in lowered:
+                codes.append("visual_difference")
+            else:
+                codes.append("other")
+        return codes
+
+    def _pick_quote(self, pool: list[str], rng: random.Random) -> str:
+        if not pool:
+            return ""
+        return rng.choice(pool)
+
+    def _recipe_message(self, candidate: PlannedRecipeCandidate) -> str:
+        nearest = candidate.distance.nearest_recipe_key
+        if not nearest:
+            return f"Ищу новый recipe: {candidate.recipe.short_label()}"
+        factors = ", ".join(candidate.distance.nearest_factors[:3]) or "visual_signature"
+        return f"Ищу новый recipe: {candidate.recipe.short_label()} | далеко от {nearest} по {factors}"
+
+    def _build_profile_from_candidate(
+        self,
+        *,
+        candidate: PlannedRecipeCandidate,
+        state: AppState,
+        source_duration: float,
+    ) -> VariationProfile:
+        recipe = candidate.recipe
+        return self.video_processor.create_profile(
+            filter_preset=recipe.filter_preset,
+            speed_factor=recipe.speed_factor,
+            trim_start=recipe.trim_start,
+            trim_end=recipe.trim_end,
+            source_duration=source_duration,
+            color_grade=state.color_grade,
+            music_cycle_index=recipe.music_cycle_index,
+            brightness_variant=recipe.brightness_variant,
+            contrast_variant=recipe.contrast_variant,
+            saturation_variant=recipe.saturation_variant,
+            accent_strength_variant=recipe.accent_strength_variant,
+            crop_family=recipe.crop_family,
+            crop_anchor=recipe.crop_anchor,
+            sharpen_enabled=recipe.sharpen_enabled,
+            recipe_key=recipe.recipe_key,
+        )
+
     def _render_with_quality_gate(
         self,
+        *,
         source_video: Path,
         variation_index: int,
         state: AppState,
@@ -131,25 +240,56 @@ class VariationGenerator:
         callback: ProgressCallback | None,
         progress_start: float,
         progress_step: float,
-        quotes_pool: list[str],
+        source_duration: float,
+        profile: VideoEditProfile,
+        primary_pool: list[str],
+        secondary_pool: list[str],
+        planner: VariationRecipePlanner,
+        ledger: SourceUniquenessLedger,
+        quote_rng: random.Random,
+        cancel_token: GenerationCancelToken | None,
     ) -> RenderAttempt:
-        import random
-
+        self._check_cancel(cancel_token)
         quality_mode = self._quality_gate_mode(state.generation)
-        attempt_limit = 1 if quality_mode == "off" else max(1, state.generation.max_quality_attempts)
-        final_output = self._build_output_path(source_video, variation_index, state.variations_output_dir)
+        render_attempt_limit = 1 if quality_mode == "off" else max(1, state.generation.render_retry_attempts)
+        final_output = self._build_output_path(source_video, variation_index, state.output_dir)
 
-        best_soft_attempt: RenderAttempt | None = None
-        last_error: Exception | None = None
+        last_render_error: Exception | None = None
+        last_quality_report: QualityReport | None = None
 
-        for attempt_number in range(1, attempt_limit + 1):
-            quote = random.choice(quotes_pool) if quotes_pool else ""
-            music_track = self.music_rotation.pick(state.media.music_tracks)
+        for attempt_number in range(1, render_attempt_limit + 1):
+            self._check_cancel(cancel_token)
+            music_choice: MusicChoice = self.music_rotation.preview_for_accept_index(
+                state.media.music_tracks,
+                self.last_summary.success_count,
+            )
+            candidate = planner.next_recipe(ledger, music_choice)
+            if candidate is None:
+                raise UniquenessExhaustedError(
+                    f"Вариация {variation_index}: уникальные комбинации исчерпаны."
+                )
+
+            variation_profile = self._build_profile_from_candidate(
+                candidate=candidate,
+                state=state,
+                source_duration=source_duration,
+            )
+            primary_quote = self._pick_quote(primary_pool, quote_rng)
+            secondary_quote = self._pick_quote(secondary_pool, quote_rng)
+
             attempt_output = self._build_output_path(
                 source_video,
                 variation_index,
-                state.variations_output_dir,
+                state.output_dir,
                 attempt_number=attempt_number,
+            )
+
+            self._notify(
+                callback,
+                "Подбор recipe",
+                self._recipe_message(candidate),
+                progress_start,
+                current_file=source_video.name,
             )
 
             last_emit_time = 0.0
@@ -164,6 +304,7 @@ class VariationGenerator:
             ) -> None:
                 nonlocal last_emit_time, last_emit_progress, emitted_zero
 
+                self._check_cancel(cancel_token)
                 now = time.monotonic()
                 is_zero_event = (rendered_seconds or 0.0) <= 0.01 and (fps or 0.0) <= 0.01
                 should_emit = False
@@ -178,19 +319,18 @@ class VariationGenerator:
 
                 if not should_emit:
                     return
-
+                if is_zero_event and emitted_zero:
+                    return
                 if is_zero_event:
-                    if emitted_zero:
-                        return
                     emitted_zero = True
 
                 last_emit_time = now
                 last_emit_progress = progress_ratio
-                total_progress = progress_start + progress_step * 0.88 * progress_ratio
+                total_progress = progress_start + progress_step * 0.84 * progress_ratio
                 self._notify(
                     callback,
                     "Рендер",
-                    f"Вариация {variation_index}",
+                    f"Вариация {variation_index}: {variation_profile.filter_preset}, попытка {attempt_number}",
                     total_progress,
                     current_file=source_video.name,
                     rendered_seconds=rendered_seconds,
@@ -198,36 +338,32 @@ class VariationGenerator:
                     fps=fps,
                 )
 
-            self._notify(
-                callback,
-                "Рендер",
-                f"Вариация {variation_index}, попытка {attempt_number}",
-                progress_start,
-                current_file=source_video.name,
-            )
-
             try:
-                profile = self.video_processor.render_variation(
+                self.video_processor.render_variation(
                     source_video=source_video,
                     output_video=attempt_output,
-                    quote=quote,
-                    text_style=state.text_style,
-                    color_grade=state.color_grade,
-                    music_track=music_track,
+                    quote_layers=[
+                        (replace(profile.layer_a, preview_text=primary_quote), primary_quote),
+                        (replace(profile.layer_b, preview_text=secondary_quote), secondary_quote),
+                    ],
+                    profile=variation_profile,
+                    music_track=music_choice.track,
                     music_volume=state.generation.music_volume,
-                    speed_range=(SPEED_MIN, SPEED_MAX),
                     progress_callback=on_render_progress,
+                    enhance_sharpness=state.generation.enhance_sharpness,
+                    cancel_token=cancel_token,
                 )
-            except Exception as error:  # noqa: BLE001
-                last_error = error
+            except GenerationCancelledError:
                 attempt_output.unlink(missing_ok=True)
-                if attempt_number >= attempt_limit:
-                    break
+                raise
+            except Exception as error:  # noqa: BLE001
+                last_render_error = error
+                attempt_output.unlink(missing_ok=True)
                 self._notify(
                     callback,
                     "Ошибка",
-                    f"Вариация {variation_index}: сбой рендера, повторяю попытку. {error}",
-                    min(0.99, progress_start + progress_step * 0.9),
+                    f"Вариация {variation_index}: сбой рендера для recipe {candidate.recipe.recipe_key}. Ищу новый кандидат.",
+                    min(0.99, progress_start + progress_step * 0.88),
                     level="warning",
                     current_file=source_video.name,
                 )
@@ -235,22 +371,27 @@ class VariationGenerator:
 
             if quality_mode == "off":
                 final_path = self._finalize_output(attempt_output, final_output)
+                ledger.record_accepted(candidate.recipe)
                 return RenderAttempt(
                     output_video=final_path,
-                    profile=profile,
+                    profile=variation_profile,
                     report=QualityReport(
                         sharpness_score=0.0,
                         visual_difference_score=100.0,
                         format_ok=True,
+                        duration_seconds=variation_profile.output_duration,
+                        duration_unique=True,
                         warnings=[],
                     ),
-                    quote=quote,
-                    music_track=music_track,
+                    primary_quote=primary_quote,
+                    secondary_quote=secondary_quote,
+                    music_track=music_choice.track,
                     snapshot=None,
                 )
 
             def on_quality_progress(message: str, progress_ratio: float) -> None:
-                total_progress = progress_start + progress_step * (0.88 + 0.10 * progress_ratio)
+                self._check_cancel(cancel_token)
+                total_progress = progress_start + progress_step * (0.84 + 0.14 * progress_ratio)
                 self._notify(
                     callback,
                     "Проверка качества",
@@ -259,73 +400,81 @@ class VariationGenerator:
                     current_file=attempt_output.name,
                 )
 
-            report, snapshot = self.quality_checker.evaluate(
-                attempt_output,
-                reference_snapshots,
-                callback=on_quality_progress,
-            )
-            attempt = RenderAttempt(
-                output_video=attempt_output,
-                profile=profile,
-                report=report,
-                quote=quote,
-                music_track=music_track,
-                snapshot=snapshot,
-            )
+            try:
+                report, snapshot = self.quality_checker.evaluate(
+                    attempt_output,
+                    reference_snapshots,
+                    callback=on_quality_progress,
+                    duration_uniqueness_precision=state.generation.duration_uniqueness_precision,
+                )
+            except GenerationCancelledError:
+                attempt_output.unlink(missing_ok=True)
+                raise
 
             if report.passed:
                 final_path = self._finalize_output(attempt_output, final_output)
                 if snapshot is not None:
                     snapshot.video_path = final_path
-                attempt.output_video = final_path
-                return attempt
-
-            if quality_mode == "soft" and report.hard_checks_passed:
-                if best_soft_attempt is None or report.visual_difference_score >= best_soft_attempt.report.visual_difference_score:
-                    if best_soft_attempt is not None:
-                        best_soft_attempt.output_video.unlink(missing_ok=True)
-                    best_soft_attempt = attempt
-                else:
-                    attempt_output.unlink(missing_ok=True)
-            else:
-                attempt_output.unlink(missing_ok=True)
-
-            warning_text = "; ".join(report.warnings) or "Кандидат не прошёл quality gate."
-            if attempt_number < attempt_limit:
-                self._notify(
-                    callback,
-                    "Проверка качества",
-                    f"Вариация {variation_index}: повтор рендера. {warning_text}",
-                    min(0.99, progress_start + progress_step * 0.98),
-                    level="warning",
-                    current_file=attempt_output.name,
+                ledger.record_accepted(candidate.recipe)
+                return RenderAttempt(
+                    output_video=final_path,
+                    profile=variation_profile,
+                    report=report,
+                    primary_quote=primary_quote,
+                    secondary_quote=secondary_quote,
+                    music_track=music_choice.track,
+                    snapshot=snapshot,
                 )
 
-        if quality_mode == "soft" and best_soft_attempt is not None:
-            best_soft_attempt.report.warnings.append("Принята после soft quality gate.")
-            best_soft_attempt.soft_accepted = True
-            final_path = self._finalize_output(best_soft_attempt.output_video, final_output)
-            best_soft_attempt.output_video = final_path
-            if best_soft_attempt.snapshot is not None:
-                best_soft_attempt.snapshot.video_path = final_path
+            attempt_output.unlink(missing_ok=True)
+            ledger.record_rejected(candidate.recipe)
+            last_quality_report = report
+            nearest_name = report.nearest_reference_video.name if report.nearest_reference_video is not None else "нет"
+            close_factors = ", ".join(candidate.distance.nearest_factors[:4]) or "visual_signature"
+            warning_text = "; ".join(report.warnings) or "Кандидат не прошёл quality gate."
             self._notify(
                 callback,
                 "Проверка качества",
-                f"Вариация {variation_index}: soft-accept после {attempt_limit} попыток",
-                min(0.99, progress_start + progress_step * 0.99),
+                (
+                    f"Вариация {variation_index}: recipe отклонён. "
+                    f"Ближайший референс: {nearest_name}. "
+                    f"Слишком близко по {close_factors}. {warning_text}"
+                ),
+                min(0.99, progress_start + progress_step * 0.98),
                 level="warning",
-                current_file=final_output.name,
+                current_file=source_video.name,
             )
-            return best_soft_attempt
 
         final_output.unlink(missing_ok=True)
-        if last_error is not None:
-            raise RuntimeError(f"Вариация {variation_index}: {last_error}") from last_error
-        raise RuntimeError(f"Вариация {variation_index}: не прошла quality gate.")
+        if last_quality_report is not None:
+            nearest_name = (
+                last_quality_report.nearest_reference_video.name
+                if last_quality_report.nearest_reference_video is not None
+                else "нет"
+            )
+            raise QualityGateFailure(
+                f"Вариация {variation_index}: не удалось собрать достаточно отличающийся ролик. "
+                f"Ближайший референс: {nearest_name}."
+            )
+        if last_render_error is not None:
+            raise RenderFailure(f"Вариация {variation_index}: {last_render_error}") from last_render_error
+        raise UniquenessExhaustedError(f"Вариация {variation_index}: уникальные комбинации исчерпаны.")
 
-    def generate(self, state: AppState, callback: ProgressCallback | None = None) -> list[GeneratedVariation]:
+    def generate(
+        self,
+        state: AppState,
+        callback: ProgressCallback | None = None,
+        cancel_token: GenerationCancelToken | None = None,
+    ) -> list[GeneratedVariation]:
         self._validate_state(state)
-        quotes_pool = self._resolve_quotes(state)
+        self.music_rotation.reset()
+        if cancel_token is not None and cancel_token.is_cancelled():
+            self.last_summary = GenerationRunSummary(
+                requested_count=0,
+                cancelled=True,
+                cancelled_message="Генерация остановлена по запросу пользователя.",
+            )
+            return []
 
         total_jobs = len(state.media.original_videos) * state.generation.variation_count
         self.last_summary = GenerationRunSummary(requested_count=total_jobs)
@@ -335,18 +484,45 @@ class VariationGenerator:
         self._notify(
             callback,
             "Чтение файлов",
-            f"Оригиналов: {len(state.media.original_videos)}, цитат: {len(quotes_pool)}, музыки: {len(state.media.music_tracks)}",
+            (
+                f"Оригиналов: {len(state.media.original_videos)}, "
+                f"цитат A: {len(state.media.quotes_a)}, "
+                f"цитат B: {len(state.media.quotes_b)}, "
+                f"музыки: {len(state.media.music_tracks)}"
+            ),
             0.01,
         )
 
         completed_jobs = 0
         for source_video in state.media.original_videos:
-            width, height, _ = self.quality_checker.inspect_video(source_video)
+            if cancel_token is not None and cancel_token.is_cancelled():
+                self._mark_cancelled(callback, completed_jobs / total_jobs if total_jobs else 1.0)
+                return generated
+
+            width, height, source_duration = self.quality_checker.inspect_video(source_video)
             if width != 1080 or height != 1920:
                 self.logger.warning("Оригинал %s будет приведён к 1080x1920 при экспорте.", source_video.name)
 
-            source_references: list[QualityReference] = []
+            profile = self._video_profile_for(state, source_video)
+            primary_pool, secondary_pool = self._resolve_quote_pools(state, profile)
+            reference_snapshots: list[QualityReference] = []
+            ledger = SourceUniquenessLedger()
+            planner = VariationRecipePlanner(
+                source_video=source_video,
+                source_duration=source_duration,
+                settings=state.generation,
+                color_grade=state.color_grade,
+            )
+            quote_rng = random.Random(f"{source_video}|{len(primary_pool)}|{len(secondary_pool)}")
+            source_exhausted = False
+
             for variation_number in range(1, state.generation.variation_count + 1):
+                if source_exhausted:
+                    break
+                if cancel_token is not None and cancel_token.is_cancelled():
+                    self._mark_cancelled(callback, completed_jobs / total_jobs if total_jobs else 1.0)
+                    return generated
+
                 progress_start = completed_jobs / total_jobs if total_jobs else 0.0
                 progress_step = 1.0 / max(1, total_jobs)
 
@@ -355,25 +531,106 @@ class VariationGenerator:
                         source_video=source_video,
                         variation_index=variation_number,
                         state=state,
-                        reference_snapshots=source_references,
+                        reference_snapshots=reference_snapshots,
                         callback=callback,
                         progress_start=progress_start,
                         progress_step=progress_step,
-                        quotes_pool=quotes_pool,
+                        source_duration=source_duration,
+                        profile=profile,
+                        primary_pool=primary_pool,
+                        secondary_pool=secondary_pool,
+                        planner=planner,
+                        ledger=ledger,
+                        quote_rng=quote_rng,
+                        cancel_token=cancel_token,
                     )
-                except Exception as error:  # noqa: BLE001
-                    reason = str(error)
+                except GenerationCancelledError as error:
+                    self._mark_cancelled(callback, progress_start, str(error))
+                    return generated
+                except UniquenessExhaustedError as error:
+                    remaining_slots = state.generation.variation_count - variation_number + 1
+                    self.last_summary.skipped_uniqueness_count += remaining_slots
+                    self.last_summary.failed_variations.extend(
+                        FailedVariation(
+                            source_video=source_video,
+                            variation_index=index,
+                            reason="Уникальные комбинации исчерпаны.",
+                            reason_code="uniqueness_exhausted",
+                        )
+                        for index in range(variation_number, state.generation.variation_count + 1)
+                    )
+                    completed_jobs += remaining_slots
+                    source_exhausted = True
+                    self._notify(
+                        callback,
+                        "Подбор recipe",
+                        (
+                            f"{source_video.name}: уникальные комбинации исчерпаны, "
+                            f"пропускаю ещё {remaining_slots} вариаций."
+                        ),
+                        min(1.0, completed_jobs / total_jobs if total_jobs else 1.0),
+                        level="warning",
+                        current_file=source_video.name,
+                    )
+                    break
+                except QualityGateFailure as error:
+                    self.last_summary.failed_quality_count += 1
                     self.last_summary.failed_variations.append(
                         FailedVariation(
                             source_video=source_video,
                             variation_index=variation_number,
-                            reason=reason,
+                            reason=str(error),
+                            reason_code="quality_gate",
                         )
                     )
                     self._notify(
                         callback,
                         "Ошибка",
-                        f"Вариация {variation_number} пропущена: {reason}",
+                        f"Вариация {variation_number} пропущена: {error}",
+                        min(1.0, progress_start + progress_step),
+                        level="warning",
+                        current_file=source_video.name,
+                    )
+                    completed_jobs += 1
+                    if state.generation.continue_on_variation_error:
+                        continue
+                    raise
+                except RenderFailure as error:
+                    self.last_summary.failed_render_count += 1
+                    self.last_summary.failed_variations.append(
+                        FailedVariation(
+                            source_video=source_video,
+                            variation_index=variation_number,
+                            reason=str(error),
+                            reason_code="render_failure",
+                        )
+                    )
+                    self._notify(
+                        callback,
+                        "Ошибка",
+                        f"Вариация {variation_number} пропущена: {error}",
+                        min(1.0, progress_start + progress_step),
+                        level="error",
+                        current_file=source_video.name,
+                    )
+                    completed_jobs += 1
+                    if state.generation.continue_on_variation_error:
+                        continue
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    self.last_summary.failed_render_count += 1
+                    self.last_summary.failed_variations.append(
+                        FailedVariation(
+                            source_video=source_video,
+                            variation_index=variation_number,
+                            reason=str(error),
+                            reason_code="other",
+                        )
+                    )
+                    self._notify(
+                        callback,
+                        "Ошибка",
+                        f"Вариация {variation_number} пропущена: {error}",
                         min(1.0, progress_start + progress_step),
                         level="error",
                         current_file=source_video.name,
@@ -384,26 +641,35 @@ class VariationGenerator:
                     raise
 
                 if attempt.snapshot is not None:
-                    source_references.append(attempt.snapshot)
+                    reference_snapshots.append(attempt.snapshot)
 
                 generated.append(
                     GeneratedVariation(
                         source_video=source_video,
                         output_video=attempt.output_video,
-                        quote=attempt.quote,
+                        quote=attempt.primary_quote or attempt.secondary_quote,
                         music_track=attempt.music_track,
                         speed_factor=attempt.profile.speed_factor,
                         sharpness_score=attempt.report.sharpness_score,
                         visual_difference_score=attempt.report.visual_difference_score,
                         quality_warnings=list(attempt.report.warnings),
-                        accepted_after_soft_gate=attempt.soft_accepted,
+                        accepted_after_soft_gate=False,
+                        primary_quote=attempt.primary_quote,
+                        secondary_quote=attempt.secondary_quote,
+                        music_cycle_index=attempt.profile.music_cycle_index,
+                        filter_preset=attempt.profile.filter_preset,
+                        trim_start=attempt.profile.trim_start,
+                        trim_end=attempt.profile.trim_end,
+                        output_duration=attempt.profile.output_duration,
+                        warning_reason_codes=self._warning_reason_codes(attempt.report.warnings),
+                        recipe_key=attempt.profile.recipe_key,
+                        nearest_reference_video=attempt.report.nearest_reference_video,
+                        nearest_distance_score=attempt.report.nearest_distance_score,
                     )
                 )
                 self.last_summary.success_count += 1
                 if attempt.report.warnings:
                     self.last_summary.warning_count += 1
-                if attempt.soft_accepted:
-                    self.last_summary.soft_accepted_count += 1
 
                 completed_jobs += 1
                 progress_end = completed_jobs / total_jobs if total_jobs else 1.0

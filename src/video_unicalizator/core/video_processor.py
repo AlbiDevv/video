@@ -4,26 +4,69 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
+
+from PIL import Image
 
 from video_unicalizator.config import (
     DEFAULT_AUDIO_CODEC,
     DEFAULT_CRF,
+    DEFAULT_FPS,
     DEFAULT_OUTPUT_CODEC,
     DEFAULT_PRESET,
-    DEFAULT_FPS,
     TARGET_HEIGHT,
     TARGET_WIDTH,
 )
 from video_unicalizator.core.text_overlay import OverlayLayout, TextOverlayRenderer
-from video_unicalizator.state import ColorGradeProfile, TextStyle
-from video_unicalizator.utils.ffmpeg_tools import (
-    ensure_ffmpeg_environment,
-    parse_ffmpeg_progress_time,
-    probe_media,
-)
+from video_unicalizator.state import ColorGradeProfile, GenerationCancelToken, GenerationCancelledError, TextStyle
+from video_unicalizator.utils.ffmpeg_tools import ensure_ffmpeg_environment, parse_ffmpeg_progress_time, probe_media
 
 RenderProgressCallback = Callable[[float, float | None, float | None, float | None], None]
+
+
+FILTER_PRESETS: dict[str, dict[str, float | tuple[int, int, int]]] = {
+    "warm": {
+        "brightness": 0.035,
+        "contrast": 0.08,
+        "saturation": 0.11,
+        "tint_strength": 0.055,
+        "tint_color": (247, 180, 94),
+    },
+    "cool": {
+        "brightness": 0.010,
+        "contrast": 0.06,
+        "saturation": 0.06,
+        "tint_strength": 0.050,
+        "tint_color": (96, 164, 245),
+    },
+    "neutral_contrast": {
+        "brightness": 0.0,
+        "contrast": 0.12,
+        "saturation": 0.05,
+        "tint_strength": 0.0,
+        "tint_color": (255, 255, 255),
+    },
+    "sunset": {
+        "brightness": 0.030,
+        "contrast": 0.10,
+        "saturation": 0.14,
+        "tint_strength": 0.070,
+        "tint_color": (255, 122, 80),
+    },
+    "clean_cinematic": {
+        "brightness": -0.005,
+        "contrast": 0.15,
+        "saturation": -0.02,
+        "tint_strength": 0.040,
+        "tint_color": (176, 208, 255),
+    },
+}
+
+CROP_FAMILY_ZOOM: dict[str, float] = {
+    "neutral": 1.00,
+    "punch_in": 1.08,
+    "tight_crop": 1.14,
+}
 
 
 @dataclass(slots=True)
@@ -32,40 +75,92 @@ class VariationProfile:
     brightness_shift: float
     contrast_shift: float
     saturation_shift: float
-    accent_color: tuple[int, int, int]
-    accent_strength: float
+    filter_preset: str
+    trim_start: float
+    trim_end: float
+    output_duration: float
+    target_duration: float
+    music_cycle_index: int = 0
+    accent_color: tuple[int, int, int] = (255, 255, 255)
+    accent_strength: float = 0.0
+    crop_family: str = "neutral"
+    crop_anchor: str = "center"
+    brightness_variant: int = 0
+    contrast_variant: int = 0
+    saturation_variant: int = 0
+    accent_strength_variant: int = 0
+    sharpen_enabled: bool = False
+    recipe_key: str = ""
 
 
 class VideoProcessor:
-    """Рендерит одну вариацию ролика локально через ffmpeg."""
+    """Рендерит вариации роликов локально через ffmpeg."""
 
-    def create_random_profile(self, color_grade: ColorGradeProfile, speed_range: tuple[float, float]) -> VariationProfile:
-        import random
-
+    def create_profile(
+        self,
+        *,
+        filter_preset: str,
+        speed_factor: float,
+        trim_start: float,
+        trim_end: float,
+        source_duration: float,
+        color_grade: ColorGradeProfile,
+        music_cycle_index: int = 0,
+        brightness_variant: int = 0,
+        contrast_variant: int = 0,
+        saturation_variant: int = 0,
+        accent_strength_variant: int = 0,
+        crop_family: str = "neutral",
+        crop_anchor: str = "center",
+        sharpen_enabled: bool = False,
+        recipe_key: str = "",
+    ) -> VariationProfile:
+        preset_name = filter_preset if filter_preset in FILTER_PRESETS else "neutral_contrast"
+        preset = FILTER_PRESETS[preset_name]
+        trimmed_duration = max(0.12, source_duration - trim_start - trim_end)
+        output_duration = max(0.10, trimmed_duration / max(speed_factor, 0.01))
+        brightness_shift = float(preset["brightness"]) + brightness_variant * color_grade.brightness_jitter * 0.50
+        contrast_shift = float(preset["contrast"]) + contrast_variant * color_grade.contrast_jitter * 0.45
+        saturation_shift = float(preset["saturation"]) + saturation_variant * color_grade.saturation_jitter * 0.45
+        accent_strength = float(preset["tint_strength"]) + accent_strength_variant * color_grade.accent_jitter * 0.22
         return VariationProfile(
-            speed_factor=random.uniform(*speed_range),
-            brightness_shift=random.uniform(-color_grade.brightness_jitter, color_grade.brightness_jitter),
-            contrast_shift=random.uniform(-color_grade.contrast_jitter, color_grade.contrast_jitter),
-            saturation_shift=random.uniform(-color_grade.saturation_jitter, color_grade.saturation_jitter),
-            accent_color=tuple(random.randint(12, 220) for _ in range(3)),
-            accent_strength=random.uniform(0.03, color_grade.accent_jitter),
+            speed_factor=speed_factor,
+            brightness_shift=max(-0.25, min(0.25, brightness_shift)),
+            contrast_shift=max(-0.35, min(0.35, contrast_shift)),
+            saturation_shift=max(-0.35, min(0.40, saturation_shift)),
+            filter_preset=preset_name,
+            trim_start=max(0.0, trim_start),
+            trim_end=max(0.0, trim_end),
+            output_duration=output_duration,
+            target_duration=output_duration,
+            music_cycle_index=music_cycle_index,
+            accent_color=tuple(int(value) for value in preset["tint_color"]),  # type: ignore[arg-type]
+            accent_strength=max(0.0, min(0.18, accent_strength)),
+            crop_family=crop_family if crop_family in CROP_FAMILY_ZOOM else "neutral",
+            crop_anchor=crop_anchor if crop_anchor in {"center", "top", "bottom"} else "center",
+            brightness_variant=brightness_variant,
+            contrast_variant=contrast_variant,
+            saturation_variant=saturation_variant,
+            accent_strength_variant=accent_strength_variant,
+            sharpen_enabled=sharpen_enabled,
+            recipe_key=recipe_key,
         )
 
     def render_variation(
         self,
         source_video: Path,
         output_video: Path,
-        quote: str,
-        text_style: TextStyle,
-        color_grade: ColorGradeProfile,
+        quote_layers: Sequence[tuple[TextStyle, str]],
+        profile: VariationProfile,
         music_track: Path | None,
         music_volume: float,
-        speed_range: tuple[float, float],
         progress_callback: RenderProgressCallback | None = None,
+        enhance_sharpness: bool = False,
+        cancel_token: GenerationCancelToken | None = None,
     ) -> VariationProfile:
-        profile = self.create_random_profile(color_grade, speed_range)
         media_info = probe_media(source_video)
-        output_duration = max(0.1, media_info.duration / max(profile.speed_factor, 0.01))
+        if media_info.duration <= 0:
+            raise RuntimeError(f"Не удалось определить длительность видео: {source_video.name}")
 
         output_video.parent.mkdir(parents=True, exist_ok=True)
         ffmpeg_path, _ = ensure_ffmpeg_environment()
@@ -74,7 +169,7 @@ class VideoProcessor:
 
         with tempfile.TemporaryDirectory(prefix="video_unicalizator_") as temp_dir_str:
             temp_dir = Path(temp_dir_str)
-            overlay_path = self._build_overlay_file(temp_dir, quote, text_style)
+            overlay_path = self._build_overlay_file(temp_dir, quote_layers)
             command = self._build_command(
                 ffmpeg_path=ffmpeg_path,
                 source_video=source_video,
@@ -84,27 +179,39 @@ class VideoProcessor:
                 output_video=output_video,
                 profile=profile,
                 media_info=media_info,
-                output_duration=output_duration,
+                enhance_sharpness=enhance_sharpness,
             )
-            self._run_ffmpeg(command, output_duration, progress_callback)
+            self._run_ffmpeg(command, output_video, profile.output_duration, progress_callback, cancel_token)
         return profile
 
-    def _build_overlay_file(self, temp_dir: Path, quote: str, text_style: TextStyle) -> Path | None:
-        effective_quote = (quote or text_style.preview_text).strip()
-        if not effective_quote:
+    def _build_overlay_file(self, temp_dir: Path, quote_layers: Sequence[tuple[TextStyle, str]]) -> Path | None:
+        composed = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), (0, 0, 0, 0))
+        has_visible_content = False
+
+        for layer_style, quote in quote_layers:
+            effective_quote = (quote or layer_style.preview_text).strip()
+            if not layer_style.enabled or not effective_quote:
+                continue
+            renderer = TextOverlayRenderer(
+                OverlayLayout(width=TARGET_WIDTH, height=TARGET_HEIGHT),
+                layer_style,
+                effective_quote,
+            )
+            if renderer.bounds.width <= 0 or renderer.bounds.height <= 0:
+                continue
+            composed.alpha_composite(renderer.overlay_image)
+            has_visible_content = True
+
+        if not has_visible_content:
             return None
 
         overlay_path = temp_dir / "quote_overlay.png"
-        renderer = TextOverlayRenderer(
-            OverlayLayout(width=TARGET_WIDTH, height=TARGET_HEIGHT),
-            text_style,
-            effective_quote,
-        )
-        renderer.overlay_image.save(overlay_path)
+        composed.save(overlay_path)
         return overlay_path
 
     def _build_command(
         self,
+        *,
         ffmpeg_path: str,
         source_video: Path,
         overlay_path: Path | None,
@@ -113,7 +220,7 @@ class VideoProcessor:
         output_video: Path,
         profile: VariationProfile,
         media_info,
-        output_duration: float,
+        enhance_sharpness: bool,
     ) -> list[str]:
         command = [
             ffmpeg_path,
@@ -125,9 +232,9 @@ class VideoProcessor:
             str(source_video),
         ]
 
-        input_count = 1
         overlay_input_index: int | None = None
         music_input_index: int | None = None
+        input_count = 1
 
         if overlay_path is not None:
             overlay_input_index = input_count
@@ -145,7 +252,7 @@ class VideoProcessor:
             music_volume=music_volume,
             profile=profile,
             media_info=media_info,
-            output_duration=output_duration,
+            enhance_sharpness=enhance_sharpness,
         )
 
         command.extend(["-filter_complex", filter_complex, "-map", "[vout]"])
@@ -167,7 +274,7 @@ class VideoProcessor:
                 "-movflags",
                 "+faststart",
                 "-t",
-                f"{output_duration:.4f}",
+                f"{profile.output_duration:.4f}",
                 "-progress",
                 "pipe:1",
                 "-nostats",
@@ -178,58 +285,77 @@ class VideoProcessor:
 
     def _build_filter_complex(
         self,
+        *,
         overlay_input_index: int | None,
         music_input_index: int | None,
         music_volume: float,
         profile: VariationProfile,
         media_info,
-        output_duration: float,
+        enhance_sharpness: bool,
     ) -> tuple[str, str | None]:
         filters: list[str] = []
-        video_label = "vbase"
+        source_end = max(profile.trim_start + 0.12, media_info.duration - profile.trim_end)
         speed_pts = 1.0 / max(profile.speed_factor, 0.01)
-        filters.append(
-            "[0:v]"
-            f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase,"
-            f"crop={TARGET_WIDTH}:{TARGET_HEIGHT},setsar=1,"
-            f"setpts={speed_pts:.8f}*PTS,"
-            f"fps={DEFAULT_FPS},"
-            f"eq=brightness={profile.brightness_shift:.4f}:contrast={1.0 + profile.contrast_shift:.4f}:"
-            f"saturation={1.0 + profile.saturation_shift:.4f}"
-            f"[{video_label}]"
-        )
+        zoom_factor = CROP_FAMILY_ZOOM.get(profile.crop_family, 1.0)
+        scaled_width = max(TARGET_WIDTH, int(round(TARGET_WIDTH * zoom_factor)))
+        scaled_height = max(TARGET_HEIGHT, int(round(TARGET_HEIGHT * zoom_factor)))
+        crop_x = "(in_w-out_w)/2"
+        crop_y = "(in_h-out_h)/2"
+        if profile.crop_anchor == "top":
+            crop_y = "0"
+        elif profile.crop_anchor == "bottom":
+            crop_y = "in_h-out_h"
 
-        tint_label = video_label
+        video_steps = [
+            f"trim=start={profile.trim_start:.4f}:end={source_end:.4f}",
+            "setpts=PTS-STARTPTS",
+            f"scale={scaled_width}:{scaled_height}:force_original_aspect_ratio=increase",
+            f"crop={TARGET_WIDTH}:{TARGET_HEIGHT}:x={crop_x}:y={crop_y}",
+            "setsar=1",
+            f"setpts={speed_pts:.8f}*PTS",
+            f"fps={DEFAULT_FPS}",
+            (
+                f"eq=brightness={profile.brightness_shift:.4f}:"
+                f"contrast={1.0 + profile.contrast_shift:.4f}:"
+                f"saturation={1.0 + profile.saturation_shift:.4f}"
+            ),
+        ]
+        if enhance_sharpness and profile.sharpen_enabled:
+            video_steps.append("unsharp=5:5:0.55:5:5:0.0")
+        filters.append(f"[0:v]{','.join(video_steps)}[vbase]")
+
+        video_label = "vbase"
         if profile.accent_strength > 0.0:
             accent_hex = "".join(f"{component:02x}" for component in profile.accent_color)
             filters.append(
                 f"color=c=0x{accent_hex}@{profile.accent_strength:.4f}:"
-                f"s={TARGET_WIDTH}x{TARGET_HEIGHT}:d={output_duration:.4f},format=rgba[tint]"
+                f"s={TARGET_WIDTH}x{TARGET_HEIGHT}:d={profile.output_duration:.4f},format=rgba[tint]"
             )
-            filters.append(f"[{video_label}][tint]overlay=0:0:format=auto[vtinted]")
-            tint_label = "vtinted"
+            filters.append("[vbase][tint]overlay=0:0:format=auto[vtinted]")
+            video_label = "vtinted"
 
         if overlay_input_index is not None:
             filters.append(f"[{overlay_input_index}:v]format=rgba[quote_overlay]")
             filters.append(
-                f"[{tint_label}][quote_overlay]overlay=0:0:format=auto:shortest=1:eof_action=pass,format=yuv420p[vout]"
+                f"[{video_label}][quote_overlay]overlay=0:0:format=auto:shortest=1:eof_action=pass,format=yuv420p[vout]"
             )
         else:
-            filters.append(f"[{tint_label}]format=yuv420p[vout]")
+            filters.append(f"[{video_label}]format=yuv420p[vout]")
 
         audio_label: str | None = None
         if media_info.has_audio:
             filters.append(
-                f"[0:a]atempo={profile.speed_factor:.6f},"
-                f"aresample=async=1:first_pts=0,"
-                f"atrim=duration={output_duration:.4f}[voice]"
+                f"[0:a]atrim=start={profile.trim_start:.4f}:end={source_end:.4f},"
+                f"asetpts=PTS-STARTPTS,"
+                f"atempo={profile.speed_factor:.6f},"
+                f"aresample=async=1:first_pts=0[voice]"
             )
             audio_label = "voice"
 
         if music_input_index is not None:
             filters.append(
                 f"[{music_input_index}:a]volume={music_volume:.4f},"
-                f"atrim=duration={output_duration:.4f},"
+                f"atrim=duration={profile.output_duration:.4f},"
                 f"aresample=async=1:first_pts=0[music]"
             )
             if audio_label is None:
@@ -243,8 +369,10 @@ class VideoProcessor:
     def _run_ffmpeg(
         self,
         command: list[str],
+        output_video: Path,
         output_duration: float,
         progress_callback: RenderProgressCallback | None,
+        cancel_token: GenerationCancelToken | None,
     ) -> None:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         process = subprocess.Popen(
@@ -259,9 +387,28 @@ class VideoProcessor:
         )
 
         progress_fields: dict[str, str] = {}
+        cancel_requested_during_render = False
+
+        def terminate_process() -> None:
+            nonlocal cancel_requested_during_render
+            cancel_requested_during_render = True
+            if process.poll() is not None:
+                return
+            try:
+                process.terminate()
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            except OSError:
+                return
+
+        if cancel_token is not None:
+            cancel_token.register_callback(terminate_process)
         try:
             assert process.stdout is not None
             for raw_line in process.stdout:
+                if cancel_token is not None and cancel_token.is_cancelled():
+                    cancel_requested_during_render = True
                 line = raw_line.strip()
                 if not line or "=" not in line:
                     continue
@@ -289,8 +436,14 @@ class VideoProcessor:
                     )
                 progress_fields.clear()
         finally:
+            if cancel_token is not None:
+                cancel_token.unregister_callback(terminate_process)
             stderr_output = process.stderr.read() if process.stderr is not None else ""
             return_code = process.wait()
+
+        if cancel_requested_during_render:
+            output_video.unlink(missing_ok=True)
+            raise GenerationCancelledError("Рендер остановлен по запросу пользователя.")
 
         if return_code != 0:
             raise RuntimeError(stderr_output.strip() or "ffmpeg завершился с ошибкой.")

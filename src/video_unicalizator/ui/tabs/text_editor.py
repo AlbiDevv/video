@@ -3,18 +3,21 @@ from __future__ import annotations
 import tkinter as tk
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 import customtkinter as ctk
 
 from video_unicalizator.config import DEFAULT_VARIATIONS, MAX_VARIATIONS, MIN_VARIATIONS
-from video_unicalizator.state import GenerationProgressEvent, TextStyle
+from video_unicalizator.state import GenerationProgressEvent, TextStyle, VideoEditProfile
 from video_unicalizator.ui.widgets.color_picker import ColorPickerRow
 from video_unicalizator.ui.widgets.generation_console import GenerationConsole
 from video_unicalizator.ui.widgets.video_preview import VideoPreviewWidget
 
+LayerKey = Literal["A", "B"]
+
 
 class TextEditorTab(ctk.CTkFrame):
-    """Главный экран редактора цитаты и ресурсов."""
+    """Главный экран редактора ресурсов, двух цитат и per-video макетов."""
 
     def __init__(
         self,
@@ -24,26 +27,34 @@ class TextEditorTab(ctk.CTkFrame):
         on_load_originals_folder,
         on_load_music_files,
         on_load_music_folder,
-        on_load_quotes_files,
-        on_load_quotes_folder,
+        on_load_quotes_a_files,
+        on_load_quotes_a_folder,
+        on_load_quotes_b_files,
+        on_load_quotes_b_folder,
         on_choose_output_folder,
         on_apply_style,
         on_generate,
         on_video_selected,
-        on_style_changed,
+        on_profile_changed,
         on_overlay_changed,
+        on_stop_generation=None,
+        on_remove_original=None,
         **kwargs,
     ) -> None:
         super().__init__(master, fg_color="transparent", **kwargs)
-        self._fonts = fonts
+        self._fonts = fonts or ["Arial"]
         self._on_apply_style = on_apply_style
         self._on_generate = on_generate
+        self._on_stop_generation = on_stop_generation or (lambda: None)
+        self._on_remove_original = on_remove_original or (lambda: None)
         self._on_video_selected = on_video_selected
-        self._on_style_changed = on_style_changed
+        self._on_profile_changed = on_profile_changed
         self._on_overlay_changed = on_overlay_changed
-        self._position = (0.5, 0.2)
         self._suspend_callbacks = False
+        self._active_layer: LayerKey = "A"
+        self._current_profile = VideoEditProfile()
         self._original_paths: list[Path] = []
+        self._selected_video_index = 0
 
         self.grid_rowconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=0)
@@ -53,7 +64,7 @@ class TextEditorTab(ctk.CTkFrame):
 
         self.left_panel = ctk.CTkScrollableFrame(
             self,
-            width=320,
+            width=342,
             corner_radius=18,
             fg_color="#0b1320",
             border_width=1,
@@ -67,7 +78,7 @@ class TextEditorTab(ctk.CTkFrame):
 
         self.right_panel = ctk.CTkScrollableFrame(
             self,
-            width=280,
+            width=290,
             corner_radius=18,
             fg_color="#0b1320",
             border_width=1,
@@ -89,31 +100,32 @@ class TextEditorTab(ctk.CTkFrame):
             on_load_originals_folder,
             on_load_music_files,
             on_load_music_folder,
-            on_load_quotes_files,
-            on_load_quotes_folder,
+            on_load_quotes_a_files,
+            on_load_quotes_a_folder,
+            on_load_quotes_b_files,
+            on_load_quotes_b_folder,
             on_choose_output_folder,
         )
         self._build_right_panel()
-        self.load_style(TextStyle())
+        self.load_profile(VideoEditProfile())
+        self._refresh_original_actions()
 
     def _section_title(self, parent, row: int, title: str, subtitle: str | None = None) -> int:
-        label = ctk.CTkLabel(
+        ctk.CTkLabel(
             parent,
             text=title,
             font=ctk.CTkFont(family="Bahnschrift", size=17, weight="bold"),
             text_color="#f8fafc",
-        )
-        label.grid(row=row, column=0, padx=14, pady=(14, 4), sticky="w")
+        ).grid(row=row, column=0, padx=14, pady=(14, 4), sticky="w")
         row += 1
         if subtitle:
-            hint = ctk.CTkLabel(
+            ctk.CTkLabel(
                 parent,
                 text=subtitle,
                 text_color="#8ea2c0",
-                wraplength=285,
+                wraplength=304,
                 justify="left",
-            )
-            hint.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="w")
+            ).grid(row=row, column=0, padx=14, pady=(0, 8), sticky="w")
             row += 1
         return row
 
@@ -127,19 +139,18 @@ class TextEditorTab(ctk.CTkFrame):
         files_text: str,
         folder_text: str,
         accent_color: str,
-    ) -> int:
+    ) -> tuple[int, ctk.CTkButton, ctk.CTkButton]:
         row_frame = ctk.CTkFrame(parent, fg_color="#0f1b31", corner_radius=14)
         row_frame.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="ew")
         row_frame.grid_columnconfigure(0, weight=1)
         row_frame.grid_columnconfigure(1, weight=1)
 
-        title_label = ctk.CTkLabel(
+        ctk.CTkLabel(
             row_frame,
             text=title,
             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
             text_color="#f8fafc",
-        )
-        title_label.grid(row=0, column=0, columnspan=2, padx=10, pady=(8, 6), sticky="w")
+        ).grid(row=0, column=0, columnspan=2, padx=10, pady=(8, 6), sticky="w")
 
         files_button = ctk.CTkButton(
             row_frame,
@@ -162,17 +173,7 @@ class TextEditorTab(ctk.CTkFrame):
             hover_color="#334155",
         )
         folder_button.grid(row=1, column=1, padx=(5, 10), pady=(0, 10), sticky="ew")
-
-        if title == "Оригиналы":
-            self.originals_files_button = files_button
-            self.originals_folder_button = folder_button
-        elif title == "Музыка":
-            self.music_files_button = files_button
-            self.music_folder_button = folder_button
-        else:
-            self.quotes_files_button = files_button
-            self.quotes_folder_button = folder_button
-        return row + 1
+        return row + 1, files_button, folder_button
 
     def _build_left_panel(
         self,
@@ -180,8 +181,10 @@ class TextEditorTab(ctk.CTkFrame):
         on_load_originals_folder,
         on_load_music_files,
         on_load_music_folder,
-        on_load_quotes_files,
-        on_load_quotes_folder,
+        on_load_quotes_a_files,
+        on_load_quotes_a_folder,
+        on_load_quotes_b_files,
+        on_load_quotes_b_folder,
         on_choose_output_folder,
     ) -> None:
         row = 0
@@ -189,10 +192,10 @@ class TextEditorTab(ctk.CTkFrame):
             self.left_panel,
             row,
             "Ресурсы",
-            "Можно загружать по файлам или целыми папками. txt с цитатами необязателен.",
+            "Можно загружать по файлам или целыми папками. Для каждого видео хранятся свои положения слоёв A/B.",
         )
 
-        row = self._resource_row(
+        row, self.originals_files_button, self.originals_folder_button = self._resource_row(
             self.left_panel,
             row,
             "Оригиналы",
@@ -202,7 +205,7 @@ class TextEditorTab(ctk.CTkFrame):
             "Папка",
             "#2563eb",
         )
-        row = self._resource_row(
+        row, self.music_files_button, self.music_folder_button = self._resource_row(
             self.left_panel,
             row,
             "Музыка",
@@ -212,15 +215,25 @@ class TextEditorTab(ctk.CTkFrame):
             "Папка",
             "#0f766e",
         )
-        row = self._resource_row(
+        row, self.quotes_a_files_button, self.quotes_a_folder_button = self._resource_row(
             self.left_panel,
             row,
-            "Цитаты",
-            on_load_quotes_files,
-            on_load_quotes_folder,
-            "Выбрать txt",
+            "Цитаты A",
+            on_load_quotes_a_files,
+            on_load_quotes_a_folder,
+            "txt для A",
             "Папка",
             "#7c3aed",
+        )
+        row, self.quotes_b_files_button, self.quotes_b_folder_button = self._resource_row(
+            self.left_panel,
+            row,
+            "Цитаты B",
+            on_load_quotes_b_files,
+            on_load_quotes_b_folder,
+            "txt для B",
+            "Папка",
+            "#ec4899",
         )
 
         self.output_button = ctk.CTkButton(
@@ -237,10 +250,10 @@ class TextEditorTab(ctk.CTkFrame):
 
         self.output_label = ctk.CTkLabel(
             self.left_panel,
-            text="output\\variations",
+            text="output",
             text_color="#cbd5e1",
             justify="left",
-            wraplength=285,
+            wraplength=304,
         )
         self.output_label.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="w")
         row += 1
@@ -248,12 +261,45 @@ class TextEditorTab(ctk.CTkFrame):
         row = self._section_title(
             self.left_panel,
             row,
-            "Цитата для макета",
-            "Если txt не выбран, эта цитата пойдёт в генерацию. Если поле пустое, ролики будут без текста.",
+            "Слой цитаты",
+            "Настройки ниже относятся только к активному слою. Второй слой остаётся на превью и переключается без потери макета.",
         )
+
+        self.layer_switch = ctk.CTkSegmentedButton(
+            self.left_panel,
+            values=["Цитата A", "Цитата B"],
+            command=self._on_layer_switched,
+            selected_color="#2563eb",
+            selected_hover_color="#1d4ed8",
+            unselected_color="#111827",
+            unselected_hover_color="#1f2937",
+        )
+        self.layer_switch.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
+        self.layer_switch.set("Цитата A")
+        row += 1
+
+        self.layer_enabled_switch = ctk.CTkSwitch(
+            self.left_panel,
+            text="Слой включён",
+            command=self._emit_profile_change,
+            progress_color="#f97316",
+        )
+        self.layer_enabled_switch.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="w")
+        row += 1
+
+        self.sample_quote_hint = ctk.CTkLabel(
+            self.left_panel,
+            text="Если txt-пул не загружен, в генерацию пойдёт этот текст. Пустой текст выключает слой.",
+            text_color="#8ea2c0",
+            wraplength=304,
+            justify="left",
+        )
+        self.sample_quote_hint.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="w")
+        row += 1
+
         self.sample_quote_box = ctk.CTkTextbox(
             self.left_panel,
-            height=90,
+            height=92,
             corner_radius=14,
             fg_color="#09111f",
             border_width=1,
@@ -262,7 +308,7 @@ class TextEditorTab(ctk.CTkFrame):
             font=ctk.CTkFont(family="Segoe UI", size=13),
         )
         self.sample_quote_box.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
-        self.sample_quote_box.bind("<KeyRelease>", lambda _event: self._emit_style_change())
+        self.sample_quote_box.bind("<KeyRelease>", lambda _event: self._emit_profile_change())
         row += 1
 
         self.font_combo = ctk.CTkComboBox(
@@ -270,7 +316,7 @@ class TextEditorTab(ctk.CTkFrame):
             values=self._fonts,
             height=34,
             corner_radius=12,
-            command=lambda _value: self._emit_style_change(),
+            command=lambda _value: self._emit_profile_change(),
         )
         self.font_combo.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
         row += 1
@@ -307,7 +353,7 @@ class TextEditorTab(ctk.CTkFrame):
             self.left_panel,
             title="Цвет текста",
             initial_color="#FFFFFF",
-            on_change=lambda _value: self._emit_style_change(),
+            on_change=lambda _value: self._emit_profile_change(),
         )
         self.text_color_picker.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="ew")
         row += 1
@@ -316,7 +362,7 @@ class TextEditorTab(ctk.CTkFrame):
             self.left_panel,
             title="Фон цитаты",
             initial_color="#101010",
-            on_change=lambda _value: self._emit_style_change(),
+            on_change=lambda _value: self._emit_profile_change(),
         )
         self.bg_color_picker.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="ew")
         row += 1
@@ -363,6 +409,8 @@ class TextEditorTab(ctk.CTkFrame):
         self.shadow_slider.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="ew")
         row += 1
 
+        row = self._section_title(self.left_panel, row, "Генерация", "Эти параметры общие для всего запуска.")
+
         self.variation_label = ctk.CTkLabel(
             self.left_panel,
             text=f"Вариаций на оригинал: {DEFAULT_VARIATIONS}",
@@ -378,12 +426,21 @@ class TextEditorTab(ctk.CTkFrame):
             command=self._on_variation_changed,
             progress_color="#ec4899",
         )
-        self.variation_slider.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
+        self.variation_slider.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="ew")
+        row += 1
+
+        self.enhance_sharpness_switch = ctk.CTkSwitch(
+            self.left_panel,
+            text="Повысить чёткость при рендере",
+            command=self._emit_profile_change,
+            progress_color="#22c55e",
+        )
+        self.enhance_sharpness_switch.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="w")
         row += 1
 
         buttons = ctk.CTkFrame(self.left_panel, fg_color="transparent")
         buttons.grid(row=row, column=0, padx=14, pady=(0, 14), sticky="ew")
-        buttons.grid_columnconfigure((0, 1), weight=1)
+        buttons.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.apply_button = ctk.CTkButton(
             buttons,
@@ -405,77 +462,74 @@ class TextEditorTab(ctk.CTkFrame):
             fg_color="#f97316",
             hover_color="#ea580c",
         )
-        self.generate_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+        self.generate_button.grid(row=0, column=1, padx=5, sticky="ew")
+
+        self.stop_generation_button = ctk.CTkButton(
+            buttons,
+            text="Остановить",
+            command=self._on_stop_generation,
+            height=38,
+            corner_radius=12,
+            fg_color="#991b1b",
+            hover_color="#b91c1c",
+            state="disabled",
+        )
+        self.stop_generation_button.grid(row=0, column=2, padx=(5, 0), sticky="ew")
 
     def _build_right_panel(self) -> None:
         row = 0
         row = self._section_title(
             self.right_panel,
             row,
-            "Состояние проекта",
-            "Справа только служебная информация и подсказка по txt.",
+            "Video Inspector",
+            "Справа теперь быстрая навигация по исходникам, состояние слоёв и лимит warning для текущего запуска.",
         )
 
-        self.ffmpeg_label = ctk.CTkLabel(
-            self.right_panel,
-            text="FFmpeg: проверка...",
-            text_color="#f8fafc",
-            wraplength=235,
-            justify="left",
-        )
-        self.ffmpeg_label.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="ew")
+        nav_frame = ctk.CTkFrame(self.right_panel, fg_color="#0f1b31", corner_radius=14)
+        nav_frame.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
+        nav_frame.grid_columnconfigure(1, weight=1)
+        self.prev_video_button = ctk.CTkButton(nav_frame, text="Prev", width=60, command=self._select_prev_video)
+        self.prev_video_button.grid(row=0, column=0, padx=(10, 6), pady=10)
+        self.current_video_label = ctk.CTkLabel(nav_frame, text="Видео не выбрано", text_color="#f8fafc")
+        self.current_video_label.grid(row=0, column=1, padx=6, pady=10, sticky="w")
+        self.next_video_button = ctk.CTkButton(nav_frame, text="Next", width=60, command=self._select_next_video)
+        self.next_video_button.grid(row=0, column=2, padx=(6, 10), pady=10)
         row += 1
 
-        self.media_summary = ctk.CTkLabel(
+        self.inspector_summary = ctk.CTkLabel(
             self.right_panel,
-            text="Оригиналы: 0\nМузыка: 0\nЦитаты: 0",
+            text="Оригиналы: 0\nМузыка: 0\nЦитаты A: 0\nЦитаты B: 0",
             justify="left",
             anchor="w",
             text_color="#cbd5e1",
         )
-        self.media_summary.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
+        self.inspector_summary.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
         row += 1
 
-        helper_card = ctk.CTkFrame(
+        self.layer_status = ctk.CTkLabel(
             self.right_panel,
-            corner_radius=14,
-            fg_color="#0f1b31",
-            border_width=1,
-            border_color="#16253c",
-        )
-        helper_card.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
-        helper_card.grid_columnconfigure(0, weight=1)
-
-        helper_title = ctk.CTkLabel(
-            helper_card,
-            text="Как писать txt",
-            font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
-            text_color="#f8fafc",
-        )
-        helper_title.grid(row=0, column=0, padx=12, pady=(10, 6), sticky="w")
-
-        helper_text = ctk.CTkLabel(
-            helper_card,
-            text=(
-                "txt опционален.\n\n"
-                "Если txt загружен:\n"
-                "одна цитата = один блок текста,\n"
-                "блоки разделяются пустой строкой.\n\n"
-                "Если txt не загружен:\n"
-                "будет использован текст из макета.\n\n"
-                "Пустой макет = генерация без текста."
-            ),
+            text="Слои:\nA: выключен\nB: выключен",
             justify="left",
             anchor="w",
             text_color="#cbd5e1",
-            wraplength=225,
         )
-        helper_text.grid(row=1, column=0, padx=12, pady=(0, 10), sticky="ew")
+        self.layer_status.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
+        row += 1
+
+        self.output_status = ctk.CTkLabel(
+            self.right_panel,
+            text="Вывод: output",
+            justify="left",
+            anchor="w",
+            text_color="#cbd5e1",
+            wraplength=240,
+        )
+        self.output_status.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
         row += 1
 
         self.list_title = ctk.CTkLabel(
             self.right_panel,
-            text="Оригиналы для превью",
+            text="Исходники",
             font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
             text_color="#f8fafc",
         )
@@ -491,64 +545,54 @@ class TextEditorTab(ctk.CTkFrame):
             borderwidth=0,
             highlightthickness=0,
             font=("Segoe UI", 11),
-            height=12,
+            height=13,
         )
         self.listbox.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
         self.listbox.bind("<<ListboxSelect>>", self._handle_video_selected)
+        self.listbox.bind("<Delete>", self._handle_delete_pressed)
+        row += 1
 
-    def _on_font_size_changed(self, value: float) -> None:
-        self.font_size_label.configure(text=f"Размер: {int(round(value))} px")
-        self._emit_style_change()
+        self.remove_original_button = ctk.CTkButton(
+            self.right_panel,
+            text="Удалить из проекта",
+            command=self._on_remove_original,
+            height=36,
+            corner_radius=12,
+            fg_color="#7f1d1d",
+            hover_color="#991b1b",
+            state="disabled",
+        )
+        self.remove_original_button.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
 
-    def _on_box_width_changed(self, value: float) -> None:
-        self.box_width_label.configure(text=f"Ширина блока: {int(round(value * 100))}%")
-        self._emit_style_change()
+    def _current_layer_key(self) -> LayerKey:
+        return self._active_layer
 
-    def _on_bg_opacity_changed(self, value: float) -> None:
-        self.bg_opacity_label.configure(text=f"Прозрачность: {int(round(value * 100))}%")
-        self._emit_style_change()
+    def _current_layer_style(self) -> TextStyle:
+        return self._current_profile.layer_a if self._active_layer == "A" else self._current_profile.layer_b
 
-    def _on_corner_radius_changed(self, value: float) -> None:
-        self.corner_radius_label.configure(text=f"Скругление: {int(round(value))} px")
-        self._emit_style_change()
+    def _set_current_layer_style(self, style: TextStyle) -> None:
+        if self._active_layer == "A":
+            self._current_profile.layer_a = replace(style)
+        else:
+            self._current_profile.layer_b = replace(style)
 
-    def _on_shadow_changed(self, value: float) -> None:
-        self.shadow_label.configure(text=f"Тень: {int(round(value * 100))}%")
-        self._emit_style_change()
+    def _on_layer_switched(self, value: str) -> None:
+        self._persist_controls_to_profile()
+        self._active_layer = "A" if value.endswith("A") else "B"
+        self.preview.set_active_layer(self._active_layer)
+        self._load_active_layer_into_controls()
+        self._refresh_inspector()
 
-    def _on_variation_changed(self, value: float) -> None:
-        self.variation_label.configure(text=f"Вариаций на оригинал: {int(round(value))}")
-        self._emit_style_change()
-
-    def _handle_video_selected(self, _event=None) -> None:
-        selection = self.listbox.curselection()
-        if not selection:
-            return
-        self._on_video_selected(self._original_paths[selection[0]])
-
-    def _handle_overlay_change(self, style: TextStyle) -> None:
-        self._position = (style.position_x, style.position_y)
-        self._sync_controls_from_overlay(style)
-        self._on_overlay_changed(style)
-
-    def _sync_controls_from_overlay(self, style: TextStyle) -> None:
-        self._suspend_callbacks = True
-        self.font_size_slider.set(style.font_size)
-        self.box_width_slider.set(style.box_width_ratio)
-        self.corner_radius_slider.set(style.corner_radius)
-        self._on_font_size_changed(style.font_size)
-        self._on_box_width_changed(style.box_width_ratio)
-        self._on_corner_radius_changed(style.corner_radius)
-        self._suspend_callbacks = False
-
-    def _emit_style_change(self) -> None:
+    def _persist_controls_to_profile(self) -> None:
         if self._suspend_callbacks:
             return
-        self._on_style_changed(self.read_text_style(), self.read_variation_count())
+        self._set_current_layer_style(self.read_active_layer_style())
+        self.preview.load_profile(self._current_profile)
 
-    def load_style(self, style: TextStyle) -> None:
+    def _load_active_layer_into_controls(self) -> None:
+        style = self._current_layer_style()
         self._suspend_callbacks = True
-        self._position = (style.position_x, style.position_y)
+        self.layer_enabled_switch.select() if style.enabled else self.layer_enabled_switch.deselect()
         self.sample_quote_box.delete("1.0", "end")
         self.sample_quote_box.insert("1.0", style.preview_text)
         self.font_combo.set(style.font_name if style.font_name in self._fonts else self._fonts[0])
@@ -557,7 +601,6 @@ class TextEditorTab(ctk.CTkFrame):
         self.bg_opacity_slider.set(style.background_opacity)
         self.corner_radius_slider.set(style.corner_radius)
         self.shadow_slider.set(style.shadow_strength)
-        self.variation_slider.set(DEFAULT_VARIATIONS)
         self.text_color_picker.set_value(style.text_color)
         self.bg_color_picker.set_value(style.background_color)
         self._on_font_size_changed(style.font_size)
@@ -565,16 +608,97 @@ class TextEditorTab(ctk.CTkFrame):
         self._on_bg_opacity_changed(style.background_opacity)
         self._on_corner_radius_changed(style.corner_radius)
         self._on_shadow_changed(style.shadow_strength)
-        self._on_variation_changed(DEFAULT_VARIATIONS)
-        self.preview.update_style(style)
-        self.preview.update_preview_text(style.preview_text)
         self._suspend_callbacks = False
 
-    def _sample_quote(self) -> str:
-        return self.sample_quote_box.get("1.0", "end-1c").strip()
+    def _emit_profile_change(self) -> None:
+        if self._suspend_callbacks:
+            return
+        self._persist_controls_to_profile()
+        self._on_profile_changed(self.read_video_profile(), self.read_variation_count(), self.read_enhance_sharpness())
+        self._refresh_inspector()
 
-    def read_text_style(self) -> TextStyle:
+    def _on_font_size_changed(self, value: float) -> None:
+        self.font_size_label.configure(text=f"Размер: {int(round(value))} px")
+        self._emit_profile_change()
+
+    def _on_box_width_changed(self, value: float) -> None:
+        self.box_width_label.configure(text=f"Ширина блока: {int(round(value * 100))}%")
+        self._emit_profile_change()
+
+    def _on_bg_opacity_changed(self, value: float) -> None:
+        self.bg_opacity_label.configure(text=f"Прозрачность: {int(round(value * 100))}%")
+        self._emit_profile_change()
+
+    def _on_corner_radius_changed(self, value: float) -> None:
+        self.corner_radius_label.configure(text=f"Скругление: {int(round(value))} px")
+        self._emit_profile_change()
+
+    def _on_shadow_changed(self, value: float) -> None:
+        self.shadow_label.configure(text=f"Тень: {int(round(value * 100))}%")
+        self._emit_profile_change()
+
+    def _on_variation_changed(self, value: float) -> None:
+        self.variation_label.configure(text=f"Вариаций на оригинал: {int(round(value))}")
+        self._emit_profile_change()
+
+    def _handle_video_selected(self, _event=None) -> None:
+        selection = self.listbox.curselection()
+        if not selection:
+            return
+        self._selected_video_index = selection[0]
+        self._on_video_selected(self._original_paths[self._selected_video_index])
+
+    def _handle_delete_pressed(self, _event=None) -> str:
+        if self._original_paths:
+            self._on_remove_original()
+        return "break"
+
+    def _select_prev_video(self) -> None:
+        if not self._original_paths:
+            return
+        self._selected_video_index = (self._selected_video_index - 1) % len(self._original_paths)
+        self._select_video_from_index()
+
+    def _select_next_video(self) -> None:
+        if not self._original_paths:
+            return
+        self._selected_video_index = (self._selected_video_index + 1) % len(self._original_paths)
+        self._select_video_from_index()
+
+    def _select_video_from_index(self) -> None:
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(self._selected_video_index)
+        self.listbox.activate(self._selected_video_index)
+        self._on_video_selected(self._original_paths[self._selected_video_index])
+
+    def _refresh_original_actions(self) -> None:
+        has_originals = bool(self._original_paths)
+        button_state = "normal" if has_originals else "disabled"
+        self.prev_video_button.configure(state=button_state)
+        self.next_video_button.configure(state=button_state)
+        self.remove_original_button.configure(state=button_state)
+
+    def _handle_overlay_change(self, layer: LayerKey, style: TextStyle) -> None:
+        if layer == "A":
+            self._current_profile.layer_a = replace(style)
+        else:
+            self._current_profile.layer_b = replace(style)
+        self._active_layer = layer
+        self.layer_switch.set(f"Цитата {layer}")
+        self._load_active_layer_into_controls()
+        self._on_overlay_changed(layer, style)
+        self._refresh_inspector()
+
+    def load_profile(self, profile: VideoEditProfile) -> None:
+        self._current_profile = profile.copy()
+        self.preview.load_profile(self._current_profile)
+        self.preview.set_active_layer(self._active_layer)
+        self._load_active_layer_into_controls()
+        self._refresh_inspector()
+
+    def read_active_layer_style(self) -> TextStyle:
         font_size = int(round(self.font_size_slider.get()))
+        text_value = self.sample_quote_box.get("1.0", "end-1c").strip()
         return TextStyle(
             text_color=self.text_color_picker.get_value(),
             background_color=self.bg_color_picker.get_value(),
@@ -582,53 +706,92 @@ class TextEditorTab(ctk.CTkFrame):
             shadow_strength=float(self.shadow_slider.get()),
             font_size=font_size,
             font_name=self.font_combo.get(),
-            preview_text=self._sample_quote(),
-            position_x=self._position[0],
-            position_y=self._position[1],
+            preview_text=text_value,
+            position_x=self._current_layer_style().position_x,
+            position_y=self._current_layer_style().position_y,
             box_width_ratio=float(self.box_width_slider.get()),
             line_spacing=1.18,
             padding_x=max(18, int(round(font_size * 0.55))),
             padding_y=max(12, int(round(font_size * 0.35))),
             corner_radius=int(round(self.corner_radius_slider.get())),
             text_align="center",
+            enabled=bool(self.layer_enabled_switch.get()),
         )
+
+    def read_video_profile(self) -> VideoEditProfile:
+        self._persist_controls_to_profile()
+        return self._current_profile.copy()
 
     def read_variation_count(self) -> int:
         return int(round(self.variation_slider.get()))
 
-    def update_preview_style(self, style: TextStyle) -> None:
-        style = replace(style, preview_text=self._sample_quote())
-        self.preview.update_style(style)
-        self.preview.update_preview_text(style.preview_text)
+    def read_enhance_sharpness(self) -> bool:
+        return bool(self.enhance_sharpness_switch.get())
 
-    def set_quote_sample(self, quote: str) -> None:
-        self._suspend_callbacks = True
-        self.sample_quote_box.delete("1.0", "end")
-        self.sample_quote_box.insert("1.0", quote)
-        self._suspend_callbacks = False
-        self._emit_style_change()
+    def set_quote_sample(self, layer: LayerKey, quote: str) -> None:
+        if layer == "A":
+            self._current_profile.layer_a.preview_text = quote
+            if quote:
+                self._current_profile.layer_a.enabled = True
+        else:
+            self._current_profile.layer_b.preview_text = quote
+            if quote:
+                self._current_profile.layer_b.enabled = True
+        if self._active_layer == layer:
+            self._load_active_layer_into_controls()
+        self.preview.load_profile(self._current_profile)
+        self._refresh_inspector()
 
-    def set_originals(self, paths: list[Path]) -> None:
+    def set_originals(self, paths: list[Path], selected_path: Path | None = None) -> None:
         self._original_paths = list(paths)
         self.listbox.delete(0, "end")
         for path in paths:
             self.listbox.insert("end", path.name)
-        if paths:
+        if not paths:
+            self._selected_video_index = 0
             self.listbox.selection_clear(0, "end")
-            self.listbox.selection_set(0)
-            self.listbox.activate(0)
+            self.current_video_label.configure(text="Видео не выбрано")
+            self._refresh_original_actions()
+            return
+        if selected_path and selected_path in paths:
+            self._selected_video_index = paths.index(selected_path)
+        else:
+            self._selected_video_index = 0
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(self._selected_video_index)
+        self.listbox.activate(self._selected_video_index)
+        self.current_video_label.configure(text=paths[self._selected_video_index].name)
+        self._refresh_original_actions()
 
-    def set_media_summary(self, originals_count: int, music_count: int, quotes_count: int) -> None:
-        self.media_summary.configure(
-            text=f"Оригиналы: {originals_count}\nМузыка: {music_count}\nЦитаты: {quotes_count}"
+    def set_media_summary(
+        self,
+        *,
+        originals_count: int,
+        music_count: int,
+        quotes_count_a: int,
+        quotes_count_b: int,
+        max_warning_variations: int,
+    ) -> None:
+        self.inspector_summary.configure(
+            text=(
+                f"Оригиналы: {originals_count}\n"
+                f"Музыка: {music_count}\n"
+                f"Цитаты A: {quotes_count_a}\n"
+                f"Цитаты B: {quotes_count_b}\n"
+                f"Warning budget: {max_warning_variations}"
+            )
         )
+
+    def set_output_directory(self, path: Path) -> None:
+        path_text = str(path)
+        self.output_label.configure(text=path_text)
+        self.output_status.configure(text=f"Вывод: {path_text}")
 
     def set_ffmpeg_status(self, status_text: str, available: bool) -> None:
         color = "#22c55e" if available else "#f97316"
-        self.ffmpeg_label.configure(text=f"FFmpeg: {status_text}", text_color=color)
-
-    def set_output_directory(self, path: Path) -> None:
-        self.output_label.configure(text=str(path))
+        self.current_video_label.configure(text_color=color if not self._original_paths else "#f8fafc")
+        if not self._original_paths:
+            self.current_video_label.configure(text=status_text)
 
     def clear_generation_console(self) -> None:
         self.generation_console.clear()
@@ -636,13 +799,22 @@ class TextEditorTab(ctk.CTkFrame):
     def set_generation_console_expanded(self, expanded: bool) -> None:
         self.generation_console.set_expanded(expanded)
 
+    def set_stop_button_state(self, *, is_running: bool, stop_requested: bool) -> None:
+        if is_running:
+            self.stop_generation_button.configure(
+                state="disabled" if stop_requested else "normal",
+                text="Останавливаю..." if stop_requested else "Остановить",
+            )
+        else:
+            self.stop_generation_button.configure(state="disabled", text="Остановить")
+
     def push_generation_event(self, event: GenerationProgressEvent) -> None:
         if event.stage not in {"Ожидание"}:
             self.generation_console.set_expanded(True)
         self.generation_console.push_event(event)
         if event.stage in {"Рендер", "Проверка качества", "Экспорт расписания"}:
             self.preview.set_runtime_status(event.message)
-        elif event.stage in {"Готово", "Ошибка", "Ожидание"}:
+        elif event.stage in {"Готово", "Ошибка", "Ожидание", "Остановлено", "Остановка"}:
             self.preview.set_runtime_status(None)
 
     def set_generation_enabled(self, enabled: bool) -> None:
@@ -652,11 +824,14 @@ class TextEditorTab(ctk.CTkFrame):
             self.originals_folder_button,
             self.music_files_button,
             self.music_folder_button,
-            self.quotes_files_button,
-            self.quotes_folder_button,
+            self.quotes_a_files_button,
+            self.quotes_a_folder_button,
+            self.quotes_b_files_button,
+            self.quotes_b_folder_button,
             self.output_button,
             self.apply_button,
             self.generate_button,
+            self.remove_original_button,
             self.font_combo,
             self.sample_quote_box,
             self.font_size_slider,
@@ -665,8 +840,27 @@ class TextEditorTab(ctk.CTkFrame):
             self.corner_radius_slider,
             self.shadow_slider,
             self.variation_slider,
+            self.prev_video_button,
+            self.next_video_button,
         ):
             widget.configure(state=state)
+        self.listbox.configure(state=state)
+        self.layer_switch.configure(state=state)
+        self.layer_enabled_switch.configure(state=state)
+        self.enhance_sharpness_switch.configure(state=state)
         self.text_color_picker.set_enabled(enabled)
         self.bg_color_picker.set_enabled(enabled)
         self.preview.set_interaction_enabled(enabled)
+        if enabled:
+            self._refresh_original_actions()
+
+    def _refresh_inspector(self) -> None:
+        a = self._current_profile.layer_a
+        b = self._current_profile.layer_b
+        self.layer_status.configure(
+            text=(
+                f"Слои:\n"
+                f"A: {'вкл' if a.enabled else 'выкл'} | текст: {len(a.preview_text.strip())} симв.\n"
+                f"B: {'вкл' if b.enabled else 'выкл'} | текст: {len(b.preview_text.strip())} симв."
+            )
+        )

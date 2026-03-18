@@ -5,7 +5,7 @@ from typing import Callable
 
 from video_unicalizator.scheduler.excel_exporter import ExcelExporter
 from video_unicalizator.scheduler.schedule_builder import ScheduleBuilder
-from video_unicalizator.state import GeneratedVariation, GenerationProgressEvent, ScheduleEntry
+from video_unicalizator.state import GeneratedVariation, GenerationCancelToken, GenerationProgressEvent, ScheduleEntry
 
 ProgressCallback = Callable[[GenerationProgressEvent], None]
 
@@ -22,7 +22,9 @@ class ExportService:
         variations: list[GeneratedVariation],
         output_dir: Path,
         callback: ProgressCallback | None = None,
-    ) -> tuple[list[ScheduleEntry], Path]:
+        cancel_token: GenerationCancelToken | None = None,
+    ) -> tuple[list[ScheduleEntry], Path | None]:
+        cancelled_on_entry = cancel_token.is_cancelled() if cancel_token is not None else False
         if callback:
             callback(
                 GenerationProgressEvent(
@@ -43,7 +45,25 @@ class ExportService:
             )
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / "Расписание_выкладки.xlsx"
-        self.excel_exporter.export(entries, output_file)
+        temp_output = output_dir / f"{output_file.stem}.tmp{output_file.suffix}"
+        temp_output.unlink(missing_ok=True)
+        self.excel_exporter.export(entries, temp_output)
+
+        if cancel_token is not None and cancel_token.is_cancelled() and not cancelled_on_entry:
+            temp_output.unlink(missing_ok=True)
+            if callback:
+                callback(
+                    GenerationProgressEvent(
+                        stage="Экспорт расписания",
+                        message="Экспорт Excel остановлен после запроса отмены.",
+                        progress=1.0,
+                        level="warning",
+                    )
+                )
+            return entries, None
+
+        output_file.unlink(missing_ok=True)
+        temp_output.replace(output_file)
 
         if callback:
             callback(

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import logging
 import tkinter as tk
 from dataclasses import replace
 
-from PIL import ImageTk
+from PIL import Image, ImageTk
 
 from video_unicalizator.config import TARGET_HEIGHT, TARGET_WIDTH
 from video_unicalizator.core.text_overlay import OverlayBounds, OverlayLayout, TextOverlayRenderer
@@ -11,7 +12,7 @@ from video_unicalizator.state import TextStyle
 
 
 class DraggableTextOverlay:
-    """WYSIWYG-оверлей цитаты для preview без тяжёлого full-rerender на каждый drag."""
+    """Интерактивный WYSIWYG-оверлей цитаты с канонической геометрией в video-space."""
 
     HANDLE_SIZE = 11
     MIN_BOX_RATIO = 0.18
@@ -23,11 +24,12 @@ class DraggableTextOverlay:
     def __init__(self, canvas: tk.Canvas, on_change) -> None:
         self.canvas = canvas
         self.on_change = on_change
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.style = TextStyle()
         self.preview_text = self.style.preview_text
 
-        self._video_size = (TARGET_WIDTH, TARGET_HEIGHT)
         self._viewport = (0, 0, 1, 1)
+        self._video_size = (TARGET_WIDTH, TARGET_HEIGHT)
 
         self._overlay_bounds_video = OverlayBounds.empty()
         self._overlay_bounds_local = OverlayBounds.empty()
@@ -37,14 +39,12 @@ class DraggableTextOverlay:
         self._selection_item: int | None = None
         self._handle_items: dict[str, int] = {}
         self._display_photo: ImageTk.PhotoImage | None = None
-        self._preview_crop = None
         self._last_image_signature: tuple | None = None
         self._debounce_after_id: str | None = None
 
         self._active_mode: str | None = None
         self._start_style = replace(self.style)
         self._start_bounds_video = OverlayBounds.empty()
-        self._start_bounds_local = OverlayBounds.empty()
         self._start_pointer_video = (0.0, 0.0)
 
     def update_scene(self, style: TextStyle, preview_text: str, viewport: tuple[int, int, int, int]) -> None:
@@ -54,12 +54,8 @@ class DraggableTextOverlay:
         if self._active_mode is None:
             self._render(force=False)
 
-    def set_viewport(self, viewport: tuple[int, int, int, int]) -> None:
-        self._viewport = viewport
-        self._render(force=True)
-
     def has_overlay(self) -> bool:
-        return bool((self.preview_text or self.style.preview_text).strip())
+        return self.style.enabled and bool((self.preview_text or self.style.preview_text).strip())
 
     def is_interacting(self) -> bool:
         return self._active_mode is not None
@@ -88,9 +84,8 @@ class DraggableTextOverlay:
         self._cancel_scheduled_render()
         self._start_style = replace(self.style)
         self._start_bounds_video = self._overlay_bounds_video
-        self._start_bounds_local = self._overlay_bounds_local
-        self._proxy_bounds_local = self._overlay_bounds_local
         self._start_pointer_video = self._canvas_to_video(canvas_x, canvas_y)
+        self._proxy_bounds_local = self._overlay_bounds_local
         return True
 
     def drag_to(self, canvas_x: int, canvas_y: int) -> bool:
@@ -128,32 +123,41 @@ class DraggableTextOverlay:
             bottom = max(top + min_height, min(video_height, video_y))
 
         target_width = max(min_width, right - left)
+        target_height = max(min_height, bottom - top)
         target_center_x = left + target_width / 2.0
+        target_center_y = top + target_height / 2.0
         self.style.box_width_ratio = max(self.MIN_BOX_RATIO, min(self.MAX_BOX_RATIO, target_width / video_width))
         self.style.position_x = max(0.0, min(1.0, target_center_x / video_width))
+        self.style.position_y = max(0.0, min(1.0, target_center_y / video_height))
 
         if self._active_mode in {"nw", "ne", "sw", "se"}:
-            target_height = max(min_height, bottom - top)
             scale_factor = target_height / max(1.0, self._start_bounds_video.height)
             self.style.font_size = max(
                 self.MIN_FONT_SIZE,
                 min(self.MAX_FONT_SIZE, int(round(self._start_style.font_size * scale_factor))),
             )
-            self.style.position_y = max(0.0, min(1.0, ((top + bottom) / 2.0) / video_height))
 
-        self._proxy_bounds_local = self._video_bounds_to_local(
-            OverlayBounds(int(round(left)), int(round(top)), int(round(right)), int(round(bottom)))
+        proxy_bounds_video = OverlayBounds(
+            int(round(left)),
+            int(round(top)),
+            int(round(right)),
+            int(round(bottom)),
         )
+        self._proxy_bounds_local = self._video_bounds_to_local(proxy_bounds_video)
         self._update_selection_items(self._proxy_bounds_local)
         self._schedule_render()
         return True
 
     def finish_interaction(self) -> None:
-        if self._active_mode is not None:
-            self._cancel_scheduled_render()
-            self._render(force=True)
-            self.on_change(replace(self.style))
-        self._active_mode = None
+        try:
+            if self._active_mode is not None:
+                self._cancel_scheduled_render()
+                self._render(force=True)
+                self.on_change(replace(self.style))
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed to finish overlay interaction")
+        finally:
+            self._active_mode = None
 
     def lift(self) -> None:
         if self._image_item is not None:
@@ -179,8 +183,6 @@ class DraggableTextOverlay:
             return
 
         image_signature = (
-            viewport_width,
-            viewport_height,
             self.preview_text,
             self.style.text_color,
             self.style.background_color,
@@ -194,6 +196,11 @@ class DraggableTextOverlay:
             self.style.padding_y,
             self.style.corner_radius,
             self.style.text_align,
+            self.style.position_x,
+            self.style.position_y,
+            self.style.enabled,
+            viewport_width,
+            viewport_height,
         )
 
         if not self.has_overlay():
@@ -206,13 +213,13 @@ class DraggableTextOverlay:
 
         if force or image_signature != self._last_image_signature or self._display_photo is None:
             renderer = TextOverlayRenderer(
-                OverlayLayout(width=viewport_width, height=viewport_height),
+                OverlayLayout(width=TARGET_WIDTH, height=TARGET_HEIGHT),
                 replace(self.style, preview_text=self.preview_text),
                 self.preview_text,
             )
-            self._overlay_bounds_local = renderer.bounds
-            self._proxy_bounds_local = renderer.bounds
-            self._overlay_bounds_video = self._local_bounds_to_video(renderer.bounds)
+            self._overlay_bounds_video = renderer.bounds
+            self._overlay_bounds_local = self._video_bounds_to_local(renderer.bounds)
+            self._proxy_bounds_local = self._overlay_bounds_local
 
             crop_box = (
                 renderer.bounds.left,
@@ -220,11 +227,15 @@ class DraggableTextOverlay:
                 max(renderer.bounds.left + 1, renderer.bounds.right),
                 max(renderer.bounds.top + 1, renderer.bounds.bottom),
             )
-            self._preview_crop = renderer.overlay_image.crop(crop_box)
-            self._display_photo = ImageTk.PhotoImage(self._preview_crop)
+            overlay_crop = renderer.overlay_image.crop(crop_box)
+            target_width = max(1, self._overlay_bounds_local.width)
+            target_height = max(1, self._overlay_bounds_local.height)
+            if overlay_crop.size != (target_width, target_height):
+                overlay_crop = overlay_crop.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            self._display_photo = ImageTk.PhotoImage(overlay_crop)
             self._last_image_signature = image_signature
 
-            global_bounds = self._local_to_canvas(renderer.bounds)
+            global_bounds = self._local_to_canvas(self._overlay_bounds_local)
             if self._image_item is None:
                 self._image_item = self.canvas.create_image(
                     global_bounds.left,
@@ -246,27 +257,26 @@ class DraggableTextOverlay:
         if self._display_photo is None or self._image_item is None:
             return
 
-        viewport_width = max(1, self._viewport[2])
-        viewport_height = max(1, self._viewport[3])
-        width = self._overlay_bounds_local.width
-        height = self._overlay_bounds_local.height
-        center_x = max(width / 2, min(viewport_width - width / 2, viewport_width * self.style.position_x))
-        center_y = max(height / 2, min(viewport_height - height / 2, viewport_height * self.style.position_y))
+        video_width, video_height = self._video_size
+        width = self._overlay_bounds_video.width
+        height = self._overlay_bounds_video.height
+        center_x = max(width / 2, min(video_width - width / 2, video_width * self.style.position_x))
+        center_y = max(height / 2, min(video_height - height / 2, video_height * self.style.position_y))
 
-        local_bounds = OverlayBounds(
+        video_bounds = OverlayBounds(
             left=int(round(center_x - width / 2)),
             top=int(round(center_y - height / 2)),
             right=int(round(center_x + width / 2)),
             bottom=int(round(center_y + height / 2)),
         )
-        self._overlay_bounds_local = local_bounds
-        self._proxy_bounds_local = local_bounds
-        self._overlay_bounds_video = self._local_bounds_to_video(local_bounds)
+        self._overlay_bounds_video = video_bounds
+        self._overlay_bounds_local = self._video_bounds_to_local(video_bounds)
+        self._proxy_bounds_local = self._overlay_bounds_local
 
-        global_bounds = self._local_to_canvas(local_bounds)
+        global_bounds = self._local_to_canvas(self._overlay_bounds_local)
         self.canvas.itemconfigure(self._image_item, state="normal")
         self.canvas.coords(self._image_item, global_bounds.left, global_bounds.top)
-        self._update_selection_items(local_bounds)
+        self._update_selection_items(self._overlay_bounds_local)
 
     def _hide_items(self) -> None:
         for item in [self._image_item, self._selection_item, *self._handle_items.values()]:
@@ -352,16 +362,6 @@ class DraggableTextOverlay:
             bottom=viewport_y + bounds.bottom,
         )
 
-    def _local_bounds_to_video(self, bounds: OverlayBounds) -> OverlayBounds:
-        viewport_width = max(1, self._viewport[2])
-        viewport_height = max(1, self._viewport[3])
-        return OverlayBounds(
-            left=int(round(bounds.left / viewport_width * TARGET_WIDTH)),
-            top=int(round(bounds.top / viewport_height * TARGET_HEIGHT)),
-            right=int(round(bounds.right / viewport_width * TARGET_WIDTH)),
-            bottom=int(round(bounds.bottom / viewport_height * TARGET_HEIGHT)),
-        )
-
     def _video_bounds_to_local(self, bounds: OverlayBounds) -> OverlayBounds:
         viewport_width = max(1, self._viewport[2])
         viewport_height = max(1, self._viewport[3])
@@ -374,9 +374,8 @@ class DraggableTextOverlay:
 
     def _canvas_to_video(self, canvas_x: int, canvas_y: int) -> tuple[float, float]:
         viewport_x, viewport_y, viewport_width, viewport_height = self._viewport
-        video_width, video_height = self._video_size
         x_ratio = (canvas_x - viewport_x) / max(1, viewport_width)
         y_ratio = (canvas_y - viewport_y) / max(1, viewport_height)
         x_ratio = max(0.0, min(1.0, x_ratio))
         y_ratio = max(0.0, min(1.0, y_ratio))
-        return x_ratio * video_width, y_ratio * video_height
+        return x_ratio * TARGET_WIDTH, y_ratio * TARGET_HEIGHT
