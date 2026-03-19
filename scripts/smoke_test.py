@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +13,7 @@ from video_unicalizator.scheduler.excel_exporter import ExcelExporter
 from video_unicalizator.scheduler.schedule_builder import ScheduleBuilder
 from video_unicalizator.state import GeneratedVariation
 from video_unicalizator.utils.ffmpeg_tools import ffmpeg_available
+from video_unicalizator.utils.temp_paths import project_temporary_directory
 
 
 def main() -> int:
@@ -34,7 +34,7 @@ def main() -> int:
     entries = builder.build(fake_variations)
     assert len(entries) == 3
 
-    with tempfile.TemporaryDirectory() as temp_dir:
+    with project_temporary_directory(prefix="smoke_", subdir="smoke") as temp_dir:
         target = Path(temp_dir) / "Расписание_выкладки.xlsx"
         ExcelExporter().export(entries, target)
         assert target.exists()

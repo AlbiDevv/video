@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -12,6 +11,7 @@ if str(SRC_DIR) not in sys.path:
 
 from video_unicalizator.scheduler.excel_exporter import ExcelExporter
 from video_unicalizator.state import ScheduleEntry
+from video_unicalizator.utils.temp_paths import project_temporary_directory
 
 
 class SmokeIntegrationTestCase(unittest.TestCase):
@@ -21,8 +21,8 @@ class SmokeIntegrationTestCase(unittest.TestCase):
             ScheduleEntry(file_name="video_02.mp4", publish_time="2026-01-01 11:00"),
         ]
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            target = Path(temp_dir) / "schedule.xlsx"
+        with project_temporary_directory(prefix="test_smoke_", subdir="tests") as temp_dir:
+            target = temp_dir / "schedule.xlsx"
             ExcelExporter().export(entries, target)
             self.assertTrue(target.exists())
 

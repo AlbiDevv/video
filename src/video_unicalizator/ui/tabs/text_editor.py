@@ -27,12 +27,33 @@ LayerKey = Literal["A", "B"]
 
 
 @dataclass(slots=True)
+class EditorHistorySnapshot:
+    profile: VideoEditProfile
+    playhead_sec: float = 0.0
+    selected_lane: TimelineLane | None = None
+    selected_clip_id: str | None = None
+    focused_layer: LayerKey = "A"
+
+
+@dataclass(slots=True)
 class VideoWorkspaceState:
     playhead_sec: float = 0.0
     timeline_zoom: float = float(TIMELINE_DEFAULT_PIXELS_PER_SECOND)
     timeline_scroll: float = 0.0
     selected_lane: TimelineLane | None = None
     selected_clip_id: str | None = None
+    selected_range_start_sec: float | None = None
+    selected_range_end_sec: float | None = None
+    undo_stack: list[EditorHistorySnapshot] = None  # type: ignore[assignment]
+    redo_stack: list[EditorHistorySnapshot] = None  # type: ignore[assignment]
+    pending_snapshot: EditorHistorySnapshot | None = None
+    pending_after_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.undo_stack is None:
+            self.undo_stack = []
+        if self.redo_stack is None:
+            self.redo_stack = []
 
 
 @dataclass(slots=True)
@@ -68,6 +89,8 @@ class MusicSectionControls:
 
 
 class TextEditorTab(ctk.CTkFrame):
+    HISTORY_DEBOUNCE_MS = 280
+    MAX_HISTORY_DEPTH = 80
     """Главный экран редактора ресурсов, двух цитат и per-video макетов."""
 
     def __init__(
@@ -115,6 +138,8 @@ class TextEditorTab(ctk.CTkFrame):
         self._video_workspace_state: dict[str, VideoWorkspaceState] = {}
         self._last_drawer_compact_state: bool | None = None
         self._layout_resize_after_id: str | None = None
+        self._editor_keypress_binding_id: str | None = None
+        self._history_restore_in_progress = False
 
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -153,6 +178,30 @@ class TextEditorTab(ctk.CTkFrame):
 
         actions_frame = ctk.CTkFrame(self.workspace_toolbar, fg_color="transparent")
         actions_frame.grid(row=0, column=2, padx=(8, 10), pady=8, sticky="e")
+        self.undo_button = ctk.CTkButton(
+            actions_frame,
+            text="Undo",
+            command=self.undo_editor_change,
+            width=74,
+            height=32,
+            corner_radius=12,
+            fg_color="#16253c",
+            hover_color="#1d3557",
+            state="disabled",
+        )
+        self.undo_button.grid(row=0, column=0, padx=(0, 6))
+        self.redo_button = ctk.CTkButton(
+            actions_frame,
+            text="Redo",
+            command=self.redo_editor_change,
+            width=74,
+            height=32,
+            corner_radius=12,
+            fg_color="#16253c",
+            hover_color="#1d3557",
+            state="disabled",
+        )
+        self.redo_button.grid(row=0, column=1, padx=(0, 6))
 
         self.generate_button = ctk.CTkButton(
             actions_frame,
@@ -164,7 +213,7 @@ class TextEditorTab(ctk.CTkFrame):
             fg_color="#f97316",
             hover_color="#ea580c",
         )
-        self.generate_button.grid(row=0, column=0, padx=(0, 6))
+        self.generate_button.grid(row=0, column=2, padx=(0, 6))
 
         self.stop_generation_button = ctk.CTkButton(
             actions_frame,
@@ -177,7 +226,7 @@ class TextEditorTab(ctk.CTkFrame):
             hover_color="#b91c1c",
             state="disabled",
         )
-        self.stop_generation_button.grid(row=0, column=1, padx=(0, 10))
+        self.stop_generation_button.grid(row=0, column=3, padx=(0, 10))
 
         toggle_frame = ctk.CTkFrame(self.workspace_toolbar, fg_color="transparent")
         toggle_frame.grid(row=0, column=3, padx=(0, 14), pady=8, sticky="e")
@@ -296,6 +345,8 @@ class TextEditorTab(ctk.CTkFrame):
         self.load_profile(VideoEditProfile())
         self._sync_toggle_buttons()
         self._refresh_original_actions()
+        self._bind_editor_shortcuts()
+        self.bind("<Destroy>", self._handle_destroy, add="+")
 
     def _pane_present(self, pane: tk.PanedWindow, widget) -> bool:
         return str(widget) in pane.panes()
@@ -385,6 +436,257 @@ class TextEditorTab(ctk.CTkFrame):
             self.after_cancel(self._layout_resize_after_id)
         self._layout_resize_after_id = self.after(90, self._refresh_layout_on_resize)
 
+    def _bind_editor_shortcuts(self) -> None:
+        toplevel = self.winfo_toplevel()
+        if self._editor_keypress_binding_id is None:
+            self._editor_keypress_binding_id = toplevel.bind("<KeyPress>", self._dispatch_editor_hotkeys, add="+")
+
+    def _handle_destroy(self, event=None) -> None:
+        self._flush_pending_history_commit()
+        if event is not None and event.widget is not self:
+            return
+        if self._editor_keypress_binding_id is None:
+            return
+        try:
+            self.winfo_toplevel().unbind("<KeyPress>", self._editor_keypress_binding_id)
+        except tk.TclError:
+            pass
+        self._editor_keypress_binding_id = None
+
+    def _handle_editor_keypress(self, event) -> str | None:
+        char = (getattr(event, "char", "") or "").lower()
+        if char not in {"x", "ч"}:
+            return None
+        if not self.winfo_exists() or not self.winfo_ismapped():
+            return None
+        focus_widget = self.focus_get() or getattr(event, "widget", None)
+        if focus_widget is None or not self._is_descendant_widget(focus_widget):
+            return None
+        if self._is_text_input_widget(focus_widget):
+            return None
+        self.timeline.request_split_selected_clip()
+        return "break"
+
+    def _is_descendant_widget(self, widget) -> bool:
+        current = widget
+        while current is not None:
+            if current == self:
+                return True
+            current = getattr(current, "master", None)
+        return False
+
+    def _is_text_input_widget(self, widget) -> bool:
+        if isinstance(widget, (ctk.CTkTextbox, ctk.CTkEntry, tk.Text, tk.Entry)):
+            return True
+        try:
+            widget_class = str(widget.winfo_class()).lower()
+        except tk.TclError:
+            return False
+        return "text" in widget_class or "entry" in widget_class
+
+    def _handle_editor_hotkeys(self, event) -> str | None:
+        if not self.winfo_exists() or not self.winfo_ismapped():
+            return None
+        focus_widget = self.focus_get() or getattr(event, "widget", None)
+        if focus_widget is None or not self._is_descendant_widget(focus_widget):
+            return None
+        keysym = (getattr(event, "keysym", "") or "").lower()
+        char = (getattr(event, "char", "") or "").lower()
+        is_control = bool(getattr(event, "state", 0) & 0x4)
+        if is_control and keysym in {"z", "я"}:
+            if self.undo_editor_change():
+                return "break"
+            return None
+        if is_control and keysym in {"u", "г"}:
+            if self.redo_editor_change():
+                return "break"
+            return None
+        if char not in {"x", "ч"} and keysym not in {"x", "ч"}:
+            return None
+        if self._is_text_input_widget(focus_widget):
+            return None
+        if self.timeline.request_split_selected_clip():
+            return "break"
+        return None
+
+    def _dispatch_editor_hotkeys(self, event) -> str | None:
+        if not self.winfo_exists() or not self.winfo_ismapped():
+            return None
+        focus_widget = self.focus_get()
+        if focus_widget is None or not self._is_descendant_widget(focus_widget):
+            focus_widget = getattr(event, "widget", None)
+        if focus_widget is None or not self._is_descendant_widget(focus_widget):
+            return None
+        keysym = (getattr(event, "keysym", "") or "").lower()
+        char = (getattr(event, "char", "") or "").lower()
+        is_control = bool(getattr(event, "state", 0) & 0x4)
+        if is_control and keysym in {"z", "\u044f"}:
+            if self.undo_editor_change():
+                return "break"
+            return None
+        if is_control and keysym in {"u", "\u0433"}:
+            if self.redo_editor_change():
+                return "break"
+            return None
+        if char not in {"x", "\u0447"} and keysym not in {"x", "\u0447"}:
+            return None
+        if self._is_text_input_widget(focus_widget):
+            return None
+        if self.timeline.request_split_selected_clip():
+            return "break"
+        return None
+
+    def _history_key_for_video(self, video_path: Path | None) -> str:
+        return str(video_path) if video_path is not None else "__default__"
+
+    def _history_state_for_video(self, video_path: Path | None = None) -> VideoWorkspaceState:
+        target = self._selected_video_path if video_path is None else video_path
+        return self._video_workspace_state.setdefault(self._history_key_for_video(target), VideoWorkspaceState())
+
+    def _capture_history_snapshot(self) -> EditorHistorySnapshot:
+        return EditorHistorySnapshot(
+            profile=self._current_profile.copy(),
+            playhead_sec=self.preview.get_playhead(),
+            selected_lane=self._selected_clip_lane,
+            selected_clip_id=self._selected_clip_id,
+            focused_layer=self._focused_layer,
+        )
+
+    def _snapshots_equal(self, left: EditorHistorySnapshot | None, right: EditorHistorySnapshot | None) -> bool:
+        if left is None or right is None:
+            return left is right
+        return (
+            left.profile == right.profile
+            and abs(left.playhead_sec - right.playhead_sec) < 1e-4
+            and left.selected_lane == right.selected_lane
+            and left.selected_clip_id == right.selected_clip_id
+            and left.focused_layer == right.focused_layer
+        )
+
+    def _trim_history_stack(self, stack: list[EditorHistorySnapshot]) -> None:
+        if len(stack) > self.MAX_HISTORY_DEPTH:
+            del stack[: len(stack) - self.MAX_HISTORY_DEPTH]
+
+    def _push_undo_snapshot(self, snapshot: EditorHistorySnapshot, *, clear_redo: bool = True) -> None:
+        state = self._history_state_for_video()
+        if state.undo_stack and self._snapshots_equal(state.undo_stack[-1], snapshot):
+            if clear_redo:
+                state.redo_stack.clear()
+            self._refresh_history_controls()
+            return
+        state.undo_stack.append(snapshot)
+        self._trim_history_stack(state.undo_stack)
+        if clear_redo:
+            state.redo_stack.clear()
+        self._refresh_history_controls()
+
+    def _begin_debounced_history_capture(self) -> None:
+        if self._history_restore_in_progress or self._suspend_callbacks:
+            return
+        state = self._history_state_for_video()
+        if state.pending_snapshot is None:
+            state.pending_snapshot = self._capture_history_snapshot()
+        if state.pending_after_id is not None:
+            self.after_cancel(state.pending_after_id)
+        state.pending_after_id = self.after(self.HISTORY_DEBOUNCE_MS, self._flush_pending_history_commit)
+
+    def _flush_pending_history_commit(self) -> None:
+        state = self._history_state_for_video()
+        if state.pending_after_id is not None:
+            try:
+                self.after_cancel(state.pending_after_id)
+            except tk.TclError:
+                pass
+            state.pending_after_id = None
+        pending = state.pending_snapshot
+        state.pending_snapshot = None
+        if pending is None or self._history_restore_in_progress:
+            self._refresh_history_controls()
+            return
+        current = self._capture_history_snapshot()
+        if not self._snapshots_equal(pending, current):
+            self._push_undo_snapshot(pending, clear_redo=True)
+        else:
+            self._refresh_history_controls()
+
+    def _pop_distinct_snapshot(
+        self,
+        stack: list[EditorHistorySnapshot],
+        current: EditorHistorySnapshot,
+    ) -> EditorHistorySnapshot | None:
+        while stack:
+            candidate = stack.pop()
+            if not self._snapshots_equal(candidate, current):
+                return candidate
+        return None
+
+    def _restore_history_snapshot(self, snapshot: EditorHistorySnapshot) -> None:
+        self._history_restore_in_progress = True
+        try:
+            self._current_profile = snapshot.profile.copy()
+            self._selected_clip_lane = snapshot.selected_lane
+            self._selected_clip_id = snapshot.selected_clip_id
+            self._focused_layer = snapshot.focused_layer
+            self.load_profile(snapshot.profile.copy())
+            self.preview.set_playhead(snapshot.playhead_sec)
+            self.timeline.set_playhead(snapshot.playhead_sec, notify=False)
+            self._selected_clip_lane = snapshot.selected_lane
+            self._selected_clip_id = snapshot.selected_clip_id
+            if snapshot.selected_lane in {"A", "B"}:
+                self._focus_layer(snapshot.selected_lane, refresh=False)
+                self.timeline.select_clip(snapshot.selected_lane, snapshot.selected_clip_id)
+            elif snapshot.selected_lane == "Music":
+                self.timeline.select_clip("Music", snapshot.selected_clip_id)
+                self.preview.set_active_layer(snapshot.focused_layer)
+            else:
+                self._focus_layer(snapshot.focused_layer, refresh=False)
+                self.timeline.select_clip(None, None)
+            self._emit_profile_change(refresh_timeline=False)
+            self._capture_workspace_state()
+        finally:
+            self._history_restore_in_progress = False
+        self._refresh_history_controls()
+
+    def undo_editor_change(self) -> bool:
+        if self.generate_button.cget("state") == "disabled":
+            return False
+        self._flush_pending_history_commit()
+        state = self._history_state_for_video()
+        current = self._capture_history_snapshot()
+        target = self._pop_distinct_snapshot(state.undo_stack, current)
+        if target is None:
+            self._refresh_history_controls()
+            return False
+        state.redo_stack.append(current)
+        self._trim_history_stack(state.redo_stack)
+        self._restore_history_snapshot(target)
+        return True
+
+    def redo_editor_change(self) -> bool:
+        if self.generate_button.cget("state") == "disabled":
+            return False
+        self._flush_pending_history_commit()
+        state = self._history_state_for_video()
+        current = self._capture_history_snapshot()
+        target = self._pop_distinct_snapshot(state.redo_stack, current)
+        if target is None:
+            self._refresh_history_controls()
+            return False
+        state.undo_stack.append(current)
+        self._trim_history_stack(state.undo_stack)
+        self._restore_history_snapshot(target)
+        return True
+
+    def _refresh_history_controls(self) -> None:
+        state = self._history_state_for_video()
+        enabled = self.generate_button.cget("state") != "disabled"
+        undo_state = "normal" if enabled and bool(state.undo_stack or state.pending_snapshot is not None) else "disabled"
+        redo_state = "normal" if enabled and bool(state.redo_stack) else "disabled"
+        if hasattr(self, "undo_button"):
+            self.undo_button.configure(state=undo_state)
+        if hasattr(self, "redo_button"):
+            self.redo_button.configure(state=redo_state)
+
     def _refresh_layout_on_resize(self) -> None:
         self._layout_resize_after_id = None
         compact_mode = (self.winfo_width() or 0) < 1380
@@ -392,29 +694,40 @@ class TextEditorTab(ctk.CTkFrame):
             self._apply_workspace_layout()
 
     def _capture_workspace_state(self) -> None:
-        if self._selected_video_path is None:
-            return
-        self._video_workspace_state[str(self._selected_video_path)] = VideoWorkspaceState(
-            playhead_sec=self.preview.get_playhead(),
-            timeline_zoom=self.timeline.read_view_state()[0],
-            timeline_scroll=self.timeline.read_view_state()[1],
-            selected_lane=self._selected_clip_lane,
-            selected_clip_id=self._selected_clip_id,
-        )
+        state = self._history_state_for_video()
+        self._flush_pending_history_commit()
+        state.playhead_sec = self.preview.get_playhead()
+        state.timeline_zoom = self.timeline.read_view_state()[0]
+        state.timeline_scroll = self.timeline.read_view_state()[1]
+        state.selected_lane = self._selected_clip_lane
+        state.selected_clip_id = self._selected_clip_id
+        state.selected_range_start_sec = None
+        state.selected_range_end_sec = None
 
     def _restore_workspace_state(self) -> None:
         if self._selected_video_path is None:
+            self._refresh_history_controls()
             return
         state = self._video_workspace_state.get(str(self._selected_video_path))
         if state is None:
+            self._refresh_history_controls()
             return
         self.timeline.set_view_state(pixels_per_second=state.timeline_zoom, scroll_fraction=state.timeline_scroll)
         self.preview.set_playhead(state.playhead_sec)
+        self.timeline.clear_time_range()
         self._selected_clip_lane = state.selected_lane
         self._selected_clip_id = state.selected_clip_id
         if state.selected_lane in {"A", "B"}:
             self._focus_layer(state.selected_lane, refresh=False)
+            self.timeline.select_clip(state.selected_lane, state.selected_clip_id)
+        elif state.selected_lane == "Music":
+            self.timeline.select_clip("Music", state.selected_clip_id)
+            self.preview.set_active_layer(self._focused_layer)
+        else:
+            self.timeline.select_clip(None, None)
+            self.preview.set_active_layer(self._focused_layer)
         self._refresh_inspector()
+        self._refresh_history_controls()
 
     def _section_title(self, parent, row: int, title: str, subtitle: str | None = None) -> int:
         ctk.CTkLabel(
@@ -1096,6 +1409,7 @@ class TextEditorTab(ctk.CTkFrame):
     def _handle_section_change(self, layer: LayerKey) -> None:
         if self._suspend_callbacks:
             return
+        self._begin_debounced_history_capture()
         self._focus_layer(layer, refresh=False)
         style = self._sync_layer_from_section(layer)
         self._sync_lane_sample_to_timeline(layer, style.preview_text)
@@ -1192,6 +1506,9 @@ class TextEditorTab(ctk.CTkFrame):
         self._refresh_inspector()
 
     def _handle_timeline_change(self, timeline) -> None:
+        if not self._history_restore_in_progress:
+            self._flush_pending_history_commit()
+            self._push_undo_snapshot(self._capture_history_snapshot(), clear_redo=True)
         self._current_profile.timeline = timeline.copy()
         self._current_profile = self._current_profile.normalized_for_duration(self._current_duration or timeline.duration_hint)
         self.preview.load_profile(self._current_profile)
@@ -1204,6 +1521,7 @@ class TextEditorTab(ctk.CTkFrame):
         clip = self._selected_music_clip()
         if clip is None or self._suspend_callbacks:
             return
+        self._begin_debounced_history_capture()
         clip.volume = float(value)
         self.timeline.load_timeline(self._current_profile.timeline, self._current_duration)
         self._emit_profile_change(refresh_timeline=False)
@@ -1275,6 +1593,9 @@ class TextEditorTab(ctk.CTkFrame):
         self.remove_original_button.configure(state=button_state)
 
     def _handle_overlay_change(self, layer: LayerKey, style: TextStyle) -> None:
+        if not self._history_restore_in_progress:
+            self._flush_pending_history_commit()
+            self._push_undo_snapshot(self._capture_history_snapshot(), clear_redo=True)
         self._set_layer_style(layer, style)
         self._selected_clip_lane = layer
         self._selected_clip_id = None
@@ -1298,6 +1619,7 @@ class TextEditorTab(ctk.CTkFrame):
         self.timeline.load_timeline(self._current_profile.timeline, preview_duration)
         self._focus_layer(self._focused_layer, refresh=False)
         self._refresh_inspector()
+        self._refresh_history_controls()
 
     def read_video_profile(self) -> VideoEditProfile:
         self._sync_all_sections_to_profile()
@@ -1388,6 +1710,7 @@ class TextEditorTab(ctk.CTkFrame):
             self.drawer_video_label.configure(text=video_path.name)
         self._restore_workspace_state()
         self._refresh_inspector()
+        self._refresh_history_controls()
         self._playback_controller.schedule_audio_prewarm()
 
     def set_media_summary(
@@ -1464,6 +1787,8 @@ class TextEditorTab(ctk.CTkFrame):
             self.quotes_b_folder_button,
             self.output_button,
             self.apply_button,
+            self.undo_button,
+            self.redo_button,
             self.generate_button,
             self.remove_original_button,
             self.variation_slider,
@@ -1495,6 +1820,7 @@ class TextEditorTab(ctk.CTkFrame):
         self.timeline.set_interaction_enabled(enabled)
         if enabled:
             self._refresh_original_actions()
+        self._refresh_history_controls()
 
     def _refresh_inspector(self) -> None:
         a = self._current_profile.layer_a

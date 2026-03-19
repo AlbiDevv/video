@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -28,6 +27,7 @@ from video_unicalizator.utils.ffmpeg_tools import (
     resolve_binary,
 )
 from video_unicalizator.utils.image_tools import fit_cover_frame
+from video_unicalizator.utils.temp_paths import project_temp_root
 
 
 @dataclass(slots=True)
@@ -173,6 +173,8 @@ class ThumbnailStripCache:
     def __init__(self) -> None:
         self._cache: dict[str, list[Image.Image]] = {}
         self._pending: set[str] = set()
+        self._tile_cache: dict[str, Image.Image] = {}
+        self._pending_tiles: set[str] = set()
         self._lock = threading.Lock()
 
     def key_for(self, video_path: Path | None, *, count: int = 10, size: tuple[int, int] = (72, 42)) -> str | None:
@@ -247,10 +249,176 @@ class ThumbnailStripCache:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def tile_key_for(
+        self,
+        video_path: Path | None,
+        *,
+        bucket_index: int,
+        seconds_per_tile: float,
+        size: tuple[int, int] = (96, 60),
+    ) -> str | None:
+        if video_path is None or not video_path.exists():
+            return None
+        stat = video_path.stat()
+        return (
+            f"{video_path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}:"
+            f"tile:{bucket_index}:{seconds_per_tile:.4f}:{size[0]}x{size[1]}"
+        )
+
+    def peek_tile(
+        self,
+        video_path: Path | None,
+        *,
+        bucket_index: int,
+        seconds_per_tile: float,
+        size: tuple[int, int] = (96, 60),
+    ) -> Image.Image | None:
+        key = self.tile_key_for(video_path, bucket_index=bucket_index, seconds_per_tile=seconds_per_tile, size=size)
+        if key is None:
+            return None
+        with self._lock:
+            return self._tile_cache.get(key)
+
+    def get_filmstrip_tiles(
+        self,
+        video_path: Path | None,
+        *,
+        bucket_indices: list[int],
+        seconds_per_tile: float,
+        duration: float,
+        size: tuple[int, int] = (96, 60),
+    ) -> dict[int, Image.Image]:
+        if video_path is None or not video_path.exists() or not bucket_indices:
+            return {}
+
+        normalized_buckets = sorted({max(0, int(bucket)) for bucket in bucket_indices})
+        if not normalized_buckets:
+            return {}
+
+        result: dict[int, Image.Image] = {}
+        missing: list[int] = []
+        for bucket_index in normalized_buckets:
+            cached = self.peek_tile(
+                video_path,
+                bucket_index=bucket_index,
+                seconds_per_tile=seconds_per_tile,
+                size=size,
+            )
+            if cached is not None:
+                result[bucket_index] = cached
+            else:
+                missing.append(bucket_index)
+
+        if not missing:
+            return result
+
+        capture = cv2.VideoCapture(str(video_path))
+        fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+        media_duration = max(duration, 0.0)
+        if media_duration <= 0.0:
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+            media_duration = frame_count / max(fps, 1.0)
+        max_seek = max(0.0, media_duration - (1.0 / max(fps, 1.0)))
+
+        try:
+            for bucket_index in missing:
+                midpoint_sec = min(max_seek, max(0.0, (bucket_index + 0.5) * seconds_per_tile))
+                capture.set(cv2.CAP_PROP_POS_MSEC, midpoint_sec * 1000.0)
+                ok, frame = capture.read()
+                if not ok:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(round(midpoint_sec * fps))))
+                    ok, frame = capture.read()
+                if not ok:
+                    continue
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(rgb)
+                tile = ImageOps.fit(image, size, Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+                key = self.tile_key_for(
+                    video_path,
+                    bucket_index=bucket_index,
+                    seconds_per_tile=seconds_per_tile,
+                    size=size,
+                )
+                if key is None:
+                    continue
+                with self._lock:
+                    self._tile_cache[key] = tile
+                result[bucket_index] = tile
+        finally:
+            capture.release()
+
+        return result
+
+    def request_filmstrip_async(
+        self,
+        video_path: Path | None,
+        *,
+        bucket_indices: list[int],
+        seconds_per_tile: float,
+        duration: float,
+        size: tuple[int, int] = (96, 60),
+        callback: Callable[[], None] | None = None,
+    ) -> None:
+        if video_path is None or not video_path.exists() or not bucket_indices:
+            if callback is not None:
+                callback()
+            return
+
+        pending_keys: list[str] = []
+        missing_buckets: list[int] = []
+        for bucket_index in sorted({max(0, int(bucket)) for bucket in bucket_indices}):
+            key = self.tile_key_for(
+                video_path,
+                bucket_index=bucket_index,
+                seconds_per_tile=seconds_per_tile,
+                size=size,
+            )
+            if key is None:
+                continue
+            if self.peek_tile(
+                video_path,
+                bucket_index=bucket_index,
+                seconds_per_tile=seconds_per_tile,
+                size=size,
+            ) is not None:
+                continue
+            pending_keys.append(key)
+            missing_buckets.append(bucket_index)
+
+        if not missing_buckets:
+            if callback is not None:
+                callback()
+            return
+
+        with self._lock:
+            unresolved = [key for key in pending_keys if key not in self._pending_tiles]
+            if not unresolved:
+                return
+            for key in unresolved:
+                self._pending_tiles.add(key)
+
+        def worker() -> None:
+            try:
+                self.get_filmstrip_tiles(
+                    video_path,
+                    bucket_indices=missing_buckets,
+                    seconds_per_tile=seconds_per_tile,
+                    duration=duration,
+                    size=size,
+                )
+            finally:
+                with self._lock:
+                    for key in pending_keys:
+                        self._pending_tiles.discard(key)
+                if callback is not None:
+                    callback()
+
+        threading.Thread(target=worker, daemon=True).start()
+
 
 class PreviewAudioCache:
     def __init__(self) -> None:
-        self._cache_dir = Path(tempfile.gettempdir()) / "video_unicalizator_preview_audio"
+        self._cache_dir = project_temp_root("preview_audio")
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._pending: set[str] = set()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -13,12 +12,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from video_unicalizator.utils import ffmpeg_tools
+from video_unicalizator.utils.temp_paths import project_temporary_directory
 
 
 class FfmpegToolsTestCase(unittest.TestCase):
     def test_probe_media_uses_cache_and_no_window_creationflags(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            media_path = Path(tmpdir) / "sample.mp4"
+        with project_temporary_directory(prefix="test_ffmpeg_", subdir="tests") as tmpdir:
+            media_path = tmpdir / "sample.mp4"
             media_path.write_bytes(b"fake")
             payload = {
                 "streams": [

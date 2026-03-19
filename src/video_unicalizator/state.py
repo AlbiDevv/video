@@ -175,6 +175,22 @@ class VideoTimelineProfile:
         normalized.music_clips = _normalize_music_clips(normalized.music_clips, duration=duration)
         return normalized
 
+    def cut_range(self, start_sec: float, end_sec: float) -> "VideoTimelineProfile":
+        clipped = self.copy()
+        clipped.quote_clips_a = [
+            clip for clip in cut_timeline_clips_to_range(clipped.quote_clips_a, start_sec=start_sec, end_sec=end_sec)
+            if isinstance(clip, QuoteClip)
+        ]
+        clipped.quote_clips_b = [
+            clip for clip in cut_timeline_clips_to_range(clipped.quote_clips_b, start_sec=start_sec, end_sec=end_sec)
+            if isinstance(clip, QuoteClip)
+        ]
+        clipped.music_clips = [
+            clip for clip in cut_timeline_clips_to_range(clipped.music_clips, start_sec=start_sec, end_sec=end_sec)
+            if isinstance(clip, MusicClip)
+        ]
+        return clipped
+
 
 def _normalize_quote_clips(
     clips: list[QuoteClip],
@@ -211,6 +227,75 @@ def _normalize_quote_clips(
             )
         ]
     return []
+
+
+def cut_timeline_clips_to_range(
+    clips: list[TimelineClip],
+    *,
+    start_sec: float,
+    end_sec: float,
+) -> list[TimelineClip]:
+    """Удаляет/режет клипы так, чтобы внутри диапазона осталась пустая зона."""
+
+    cut_start = min(start_sec, end_sec)
+    cut_end = max(start_sec, end_sec)
+    if cut_end <= cut_start:
+        return [replace(clip) for clip in clips]
+
+    result: list[TimelineClip] = []
+    for original in sorted(clips, key=lambda item: (item.start_sec, item.end_sec, item.clip_id)):
+        clip = replace(original)
+        if clip.end_sec <= cut_start or clip.start_sec >= cut_end:
+            result.append(clip)
+            continue
+        if clip.start_sec >= cut_start and clip.end_sec <= cut_end:
+            continue
+        if clip.start_sec < cut_start and clip.end_sec > cut_end:
+            left_clip = replace(clip, end_sec=round(cut_start, 3))
+            right_clip = _split_clip_copy(clip, start_sec=round(cut_end, 3), end_sec=round(clip.end_sec, 3))
+            if left_clip.duration_sec >= TIMELINE_MIN_CLIP_SECONDS:
+                result.append(left_clip)
+            if right_clip.duration_sec >= TIMELINE_MIN_CLIP_SECONDS:
+                result.append(right_clip)
+            continue
+        if clip.start_sec < cut_start:
+            trimmed = replace(clip, end_sec=round(cut_start, 3))
+            if trimmed.duration_sec >= TIMELINE_MIN_CLIP_SECONDS:
+                result.append(trimmed)
+            continue
+        trimmed = replace(clip, start_sec=round(cut_end, 3))
+        if trimmed.duration_sec >= TIMELINE_MIN_CLIP_SECONDS:
+            result.append(trimmed)
+
+    return result
+
+
+def _split_clip_copy(clip: TimelineClip, *, start_sec: float, end_sec: float) -> TimelineClip:
+    if isinstance(clip, QuoteClip):
+        return QuoteClip(
+            clip_id=_clip_id(f"quote_{clip.lane.lower()}"),
+            start_sec=start_sec,
+            end_sec=end_sec,
+            enabled=clip.enabled,
+            lane=clip.lane,
+            sample_text=clip.sample_text,
+            source_mode=clip.source_mode,
+        )
+    if isinstance(clip, MusicClip):
+        return MusicClip(
+            clip_id=_clip_id("music"),
+            start_sec=start_sec,
+            end_sec=end_sec,
+            enabled=clip.enabled,
+            volume=clip.volume,
+            source_mode=clip.source_mode,
+        )
+    return TimelineClip(
+        clip_id=_clip_id("clip"),
+        start_sec=start_sec,
+        end_sec=end_sec,
+        enabled=clip.enabled,
+    )
 
 
 def _normalize_music_clips(clips: list[MusicClip], *, duration: float) -> list[MusicClip]:

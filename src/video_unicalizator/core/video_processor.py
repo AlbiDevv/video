@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import subprocess
-import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
@@ -28,6 +27,7 @@ from video_unicalizator.state import (
     TextStyle,
 )
 from video_unicalizator.utils.ffmpeg_tools import ensure_ffmpeg_environment, parse_ffmpeg_progress_time, probe_media
+from video_unicalizator.utils.temp_paths import project_temporary_directory
 
 RenderProgressCallback = Callable[[float, float | None, float | None, float | None], None]
 
@@ -181,8 +181,7 @@ class VideoProcessor:
         if not ffmpeg_path:
             raise RuntimeError("ffmpeg не найден.")
 
-        with tempfile.TemporaryDirectory(prefix="video_unicalizator_") as temp_dir_str:
-            temp_dir = Path(temp_dir_str)
+        with project_temporary_directory(prefix="video_unicalizator_", subdir="render") as temp_dir:
             quote_inputs = self._build_overlay_inputs(temp_dir, quote_segments)
             command = self._build_command(
                 ffmpeg_path=ffmpeg_path,
