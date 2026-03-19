@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from video_unicalizator.config import (
     DEFAULT_BG_COLOR,
@@ -22,8 +23,22 @@ from video_unicalizator.config import (
     DEFAULT_TEXT_COLOR,
     DEFAULT_VARIATIONS,
     MUSIC_VOLUME,
+    TIMELINE_DEFAULT_CLIP_SECONDS,
+    TIMELINE_MIN_CLIP_SECONDS,
 )
 from video_unicalizator.paths import OUTPUT_DIR
+
+LayerKey = Literal["A", "B"]
+TimelineLane = Literal["A", "B", "Music"]
+TimelineSourceMode = Literal["pool", "sample"]
+
+
+def _clip_id(prefix: str) -> str:
+    return f"{prefix}_{uuid4().hex[:10]}"
+
+
+def _clamp_seconds(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
 @dataclass(slots=True)
@@ -59,16 +74,206 @@ class TextStyle:
         return replace(self, preview_text=text)
 
 
-QuoteLayerStyle = TextStyle
+QuoteLaneStyle = TextStyle
+
+
+@dataclass(slots=True)
+class TimelineClip:
+    """Базовый клип на таймлайне."""
+
+    clip_id: str = field(default_factory=lambda: _clip_id("clip"))
+    start_sec: float = 0.0
+    end_sec: float = TIMELINE_DEFAULT_CLIP_SECONDS
+    enabled: bool = True
+
+    @property
+    def duration_sec(self) -> float:
+        return max(0.0, self.end_sec - self.start_sec)
+
+
+@dataclass(slots=True)
+class QuoteClip(TimelineClip):
+    """Временной клип для одной дорожки цитаты."""
+
+    lane: LayerKey = "A"
+    sample_text: str = ""
+    source_mode: TimelineSourceMode = "pool"
+
+
+@dataclass(slots=True)
+class MusicClip(TimelineClip):
+    """Временной музыкальный клип."""
+
+    volume: float = 1.0
+    source_mode: TimelineSourceMode = "pool"
+
+
+@dataclass(slots=True)
+class VideoTimelineProfile:
+    """Таймлайн конкретного исходника."""
+
+    quote_clips_a: list[QuoteClip] = field(default_factory=list)
+    quote_clips_b: list[QuoteClip] = field(default_factory=list)
+    music_clips: list[MusicClip] = field(default_factory=list)
+    duration_hint: float = 0.0
+
+    def copy(self) -> "VideoTimelineProfile":
+        return VideoTimelineProfile(
+            quote_clips_a=[replace(clip) for clip in self.quote_clips_a],
+            quote_clips_b=[replace(clip) for clip in self.quote_clips_b],
+            music_clips=[replace(clip) for clip in self.music_clips],
+            duration_hint=self.duration_hint,
+        )
+
+    def clips_for_lane(self, lane: TimelineLane) -> list[TimelineClip]:
+        if lane == "A":
+            return self.quote_clips_a
+        if lane == "B":
+            return self.quote_clips_b
+        return self.music_clips
+
+    def set_clips_for_lane(self, lane: TimelineLane, clips: list[TimelineClip]) -> None:
+        if lane == "A":
+            self.quote_clips_a = [replace(clip) for clip in clips if isinstance(clip, QuoteClip)]
+            return
+        if lane == "B":
+            self.quote_clips_b = [replace(clip) for clip in clips if isinstance(clip, QuoteClip)]
+            return
+        self.music_clips = [replace(clip) for clip in clips if isinstance(clip, MusicClip)]
+
+    def active_quote_clip(self, lane: LayerKey, current_time: float) -> QuoteClip | None:
+        clips = self.quote_clips_a if lane == "A" else self.quote_clips_b
+        for clip in clips:
+            if clip.enabled and clip.start_sec <= current_time <= clip.end_sec:
+                return clip
+        return None
+
+    def active_music_clips(self, current_time: float) -> list[MusicClip]:
+        return [
+            replace(clip)
+            for clip in self.music_clips
+            if clip.enabled and clip.start_sec <= current_time <= clip.end_sec
+        ]
+
+    def normalize(self, *, duration: float, layer_a: QuoteLaneStyle, layer_b: QuoteLaneStyle) -> "VideoTimelineProfile":
+        normalized = self.copy()
+        normalized.duration_hint = max(0.0, duration)
+        normalized.quote_clips_a = _normalize_quote_clips(
+            normalized.quote_clips_a,
+            duration=duration,
+            lane="A",
+            sample_text=layer_a.preview_text,
+            ensure_default=layer_a.enabled,
+        )
+        normalized.quote_clips_b = _normalize_quote_clips(
+            normalized.quote_clips_b,
+            duration=duration,
+            lane="B",
+            sample_text=layer_b.preview_text,
+            ensure_default=layer_b.enabled,
+        )
+        normalized.music_clips = _normalize_music_clips(normalized.music_clips, duration=duration)
+        return normalized
+
+
+def _normalize_quote_clips(
+    clips: list[QuoteClip],
+    *,
+    duration: float,
+    lane: LayerKey,
+    sample_text: str,
+    ensure_default: bool,
+) -> list[QuoteClip]:
+    normalized = _normalize_lane_clips(clips, duration=duration, minimum_duration=TIMELINE_MIN_CLIP_SECONDS)
+    if normalized:
+        return [
+            QuoteClip(
+                clip_id=clip.clip_id,
+                start_sec=clip.start_sec,
+                end_sec=clip.end_sec,
+                enabled=clip.enabled,
+                lane=lane,
+                sample_text=clip.sample_text or sample_text,
+                source_mode=clip.source_mode,
+            )
+            for clip in normalized
+        ]
+    if ensure_default and duration > 0:
+        return [
+            QuoteClip(
+                clip_id=_clip_id(f"quote_{lane.lower()}"),
+                start_sec=0.0,
+                end_sec=duration,
+                enabled=True,
+                lane=lane,
+                sample_text=sample_text,
+                source_mode="pool",
+            )
+        ]
+    return []
+
+
+def _normalize_music_clips(clips: list[MusicClip], *, duration: float) -> list[MusicClip]:
+    normalized = _normalize_lane_clips(clips, duration=duration, minimum_duration=TIMELINE_MIN_CLIP_SECONDS)
+    return [
+        MusicClip(
+            clip_id=clip.clip_id,
+            start_sec=clip.start_sec,
+            end_sec=clip.end_sec,
+            enabled=clip.enabled,
+            volume=max(0.0, min(2.0, clip.volume)),
+            source_mode=clip.source_mode,
+        )
+        for clip in normalized
+    ]
+
+
+def _normalize_lane_clips(
+    clips: list[TimelineClip],
+    *,
+    duration: float,
+    minimum_duration: float,
+) -> list[TimelineClip]:
+    if duration <= 0:
+        return []
+
+    normalized: list[TimelineClip] = []
+    ordered = sorted(
+        (replace(clip) for clip in clips),
+        key=lambda item: (item.start_sec, item.end_sec, item.clip_id),
+    )
+
+    for clip in ordered:
+        start_sec = _clamp_seconds(float(clip.start_sec), 0.0, duration)
+        end_sec = _clamp_seconds(float(clip.end_sec), 0.0, duration)
+        if end_sec <= start_sec:
+            end_sec = min(duration, start_sec + minimum_duration)
+        if normalized:
+            start_sec = max(start_sec, normalized[-1].end_sec)
+            if end_sec <= start_sec:
+                end_sec = min(duration, start_sec + minimum_duration)
+        if end_sec - start_sec < minimum_duration:
+            if start_sec + minimum_duration > duration:
+                continue
+            end_sec = start_sec + minimum_duration
+        if end_sec > duration:
+            if duration - start_sec < minimum_duration:
+                continue
+            end_sec = duration
+        clip.start_sec = round(start_sec, 3)
+        clip.end_sec = round(end_sec, 3)
+        normalized.append(clip)
+
+    return normalized
 
 
 @dataclass(slots=True)
 class VideoEditProfile:
-    """Полный макет конкретного исходника: два слоя цитат."""
+    """Полный макет конкретного исходника: два слоя цитат и их таймлайн."""
 
-    layer_a: QuoteLayerStyle = field(default_factory=QuoteLayerStyle)
-    layer_b: QuoteLayerStyle = field(
-        default_factory=lambda: QuoteLayerStyle(
+    layer_a: QuoteLaneStyle = field(default_factory=QuoteLaneStyle)
+    layer_b: QuoteLaneStyle = field(
+        default_factory=lambda: QuoteLaneStyle(
             preview_text="",
             position_y=0.78,
             font_size=max(28, DEFAULT_FONT_SIZE - 8),
@@ -77,9 +282,23 @@ class VideoEditProfile:
             enabled=False,
         )
     )
+    timeline: VideoTimelineProfile = field(default_factory=VideoTimelineProfile)
 
     def copy(self) -> "VideoEditProfile":
-        return VideoEditProfile(layer_a=replace(self.layer_a), layer_b=replace(self.layer_b))
+        return VideoEditProfile(
+            layer_a=replace(self.layer_a),
+            layer_b=replace(self.layer_b),
+            timeline=self.timeline.copy(),
+        )
+
+    def normalized_for_duration(self, duration: float) -> "VideoEditProfile":
+        normalized = self.copy()
+        normalized.timeline = normalized.timeline.normalize(
+            duration=duration,
+            layer_a=normalized.layer_a,
+            layer_b=normalized.layer_b,
+        )
+        return normalized
 
 
 @dataclass(slots=True)
@@ -178,6 +397,46 @@ class MediaLibrary:
 
 
 @dataclass(slots=True)
+class EditorLayoutState:
+    """Текущее состояние workspace редактора."""
+
+    media_rail_width: int = 280
+    inspector_width: int = 320
+    timeline_height: int = 360
+    media_rail_visible: bool = True
+    inspector_visible: bool = True
+    drawer_visible: bool = False
+    timeline_visible: bool = True
+    console_visible: bool = False
+
+
+@dataclass(slots=True)
+class RenderedQuoteAssignment:
+    """Итоговое назначение текста на конкретный клип дорожки."""
+
+    lane: LayerKey
+    clip_id: str
+    text: str
+    start_sec: float
+    end_sec: float
+    source_mode: TimelineSourceMode = "pool"
+    cycle_index: int = 0
+
+
+@dataclass(slots=True)
+class RenderedMusicAssignment:
+    """Итоговое назначение трека на музыкальный клип."""
+
+    clip_id: str
+    track: Path | None
+    start_sec: float
+    end_sec: float
+    volume: float
+    source_mode: TimelineSourceMode = "pool"
+    cycle_index: int = 0
+
+
+@dataclass(slots=True)
 class GeneratedVariation:
     """Описание одного сгенерированного ролика."""
 
@@ -202,6 +461,8 @@ class GeneratedVariation:
     skip_reason: str = ""
     nearest_reference_video: Path | None = None
     nearest_distance_score: float | None = None
+    quote_assignments: list[RenderedQuoteAssignment] = field(default_factory=list)
+    music_assignments: list[RenderedMusicAssignment] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -240,7 +501,7 @@ class AppState:
     generation: GenerationSettings = field(default_factory=GenerationSettings)
     color_grade: ColorGradeProfile = field(default_factory=ColorGradeProfile)
     selected_video: Path | None = None
-    selected_layer: Literal["A", "B"] = "A"
+    selected_layer: TimelineLane = "A"
     default_layer_a_sample_text: str = DEFAULT_PREVIEW_TEXT
     default_layer_b_sample_text: str = ""
     video_profiles: dict[str, VideoEditProfile] = field(default_factory=dict)
@@ -250,6 +511,7 @@ class AppState:
     output_dir: Path = field(default_factory=lambda: OUTPUT_DIR)
     ffmpeg_available: bool = False
     last_music_track: Path | None = None
+    editor_layout: EditorLayoutState = field(default_factory=EditorLayoutState)
 
     @property
     def variations_output_dir(self) -> Path:
@@ -273,7 +535,7 @@ class AppState:
             preview_text=(self.default_layer_a_sample_text or self.text_style.preview_text).strip() or DEFAULT_PREVIEW_TEXT,
             enabled=True,
         )
-        default_layer_b = QuoteLayerStyle(
+        default_layer_b = QuoteLaneStyle(
             preview_text=(self.default_layer_b_sample_text or "").strip(),
             position_y=0.78,
             font_size=max(28, self.text_style.font_size - 8),
@@ -288,7 +550,7 @@ class AppState:
         )
         return VideoEditProfile(layer_a=default_layer_a, layer_b=default_layer_b)
 
-    def set_default_layer_sample(self, layer: Literal["A", "B"], text: str) -> None:
+    def set_default_layer_sample(self, layer: LayerKey, text: str) -> None:
         normalized = text.strip()
         if layer == "A":
             self.default_layer_a_sample_text = normalized or DEFAULT_PREVIEW_TEXT

@@ -9,7 +9,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from video_unicalizator.state import AppState
+from video_unicalizator.state import AppState, MusicClip, QuoteClip
 
 
 class AppStateTestCase(unittest.TestCase):
@@ -65,6 +65,37 @@ class AppStateTestCase(unittest.TestCase):
 
         self.assertEqual(profile.layer_a.preview_text, "Цитата A")
         self.assertEqual(profile.layer_b.preview_text, "Цитата B")
+
+
+    def test_normalized_profile_creates_default_full_clip_for_enabled_layers(self) -> None:
+        state = AppState()
+        profile = state.build_default_profile()
+        profile.layer_b.enabled = True
+        profile.layer_b.preview_text = "Layer B"
+
+        normalized = profile.normalized_for_duration(9.5)
+
+        self.assertEqual(len(normalized.timeline.quote_clips_a), 1)
+        self.assertEqual(len(normalized.timeline.quote_clips_b), 1)
+        self.assertAlmostEqual(normalized.timeline.quote_clips_a[0].end_sec, 9.5, places=3)
+        self.assertAlmostEqual(normalized.timeline.quote_clips_b[0].end_sec, 9.5, places=3)
+
+    def test_normalized_profile_clamps_overlapping_clips_per_lane(self) -> None:
+        state = AppState()
+        profile = state.build_default_profile()
+        profile.timeline.quote_clips_a = [
+            QuoteClip(lane="A", start_sec=0.0, end_sec=4.0),
+            QuoteClip(lane="A", start_sec=3.0, end_sec=6.0),
+        ]
+        profile.timeline.music_clips = [
+            MusicClip(start_sec=1.0, end_sec=3.0, volume=1.0),
+            MusicClip(start_sec=2.5, end_sec=5.0, volume=1.0),
+        ]
+
+        normalized = profile.normalized_for_duration(8.0)
+
+        self.assertGreaterEqual(normalized.timeline.quote_clips_a[1].start_sec, normalized.timeline.quote_clips_a[0].end_sec)
+        self.assertGreaterEqual(normalized.timeline.music_clips[1].start_sec, normalized.timeline.music_clips[0].end_sec)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,10 @@ class MediaProbeInfo:
     has_audio: bool
 
 
+def no_window_creationflags() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _binary_candidates(binary_name: str) -> list[Path]:
     local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
     search_roots = [
@@ -97,6 +101,13 @@ def probe_media(video_path: Path) -> MediaProbeInfo:
     if not ffprobe_path:
         raise RuntimeError("ffprobe не найден.")
 
+    resolved = video_path.resolve()
+    stat = resolved.stat()
+    return _probe_media_cached(str(resolved), stat.st_mtime_ns, stat.st_size, ffprobe_path)
+
+
+@lru_cache(maxsize=256)
+def _probe_media_cached(video_path: str, _mtime_ns: int, _size: int, ffprobe_path: str) -> MediaProbeInfo:
     command = [
         ffprobe_path,
         "-v",
@@ -105,9 +116,15 @@ def probe_media(video_path: Path) -> MediaProbeInfo:
         "-show_format",
         "-of",
         "json",
-        str(video_path),
+        video_path,
     ]
-    completed = subprocess.run(command, capture_output=True, text=True, check=True)
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=True,
+        creationflags=no_window_creationflags(),
+    )
     payload = json.loads(completed.stdout or "{}")
 
     streams = payload.get("streams", [])

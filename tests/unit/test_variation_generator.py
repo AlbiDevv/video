@@ -17,7 +17,7 @@ from video_unicalizator.core.variation_generator import (
     VariationGenerator,
 )
 from video_unicalizator.core.video_processor import VariationProfile
-from video_unicalizator.state import AppState, GenerationCancelToken, VideoEditProfile
+from video_unicalizator.state import AppState, GenerationCancelToken, MusicClip, QuoteClip, VideoEditProfile
 
 
 class VariationGeneratorTestCase(unittest.TestCase):
@@ -195,6 +195,65 @@ class VariationGeneratorTestCase(unittest.TestCase):
         self.assertEqual(len(generated), 1)
         self.assertEqual(generator.last_summary.success_count, 1)
         self.assertEqual(generator.last_summary.skipped_uniqueness_count, 2)
+
+    def test_build_quote_segments_uses_unused_quotes_before_repeat(self) -> None:
+        generator = VariationGenerator()
+        profile = VideoEditProfile().normalized_for_duration(8.0)
+        profile.timeline.quote_clips_a = [
+            QuoteClip(lane="A", start_sec=0.0, end_sec=2.0),
+            QuoteClip(lane="A", start_sec=3.0, end_sec=5.0),
+        ]
+        variation_profile = VariationProfile(
+            speed_factor=1.0,
+            brightness_shift=0.0,
+            contrast_shift=0.0,
+            saturation_shift=0.0,
+            filter_preset="neutral_contrast",
+            trim_start=0.0,
+            trim_end=0.0,
+            output_duration=8.0,
+            target_duration=8.0,
+        )
+
+        with patch("random.choice", side_effect=lambda options: options[0]):
+            segments = generator._build_quote_segments(
+                profile=profile,
+                variation_profile=variation_profile,
+                source_duration=8.0,
+                primary_pool=["A1", "A2", "A3"],
+                secondary_pool=[],
+            )
+
+        self.assertEqual([segment.assignment.text for segment in segments], ["A1", "A2"])
+
+    def test_build_music_segments_uses_different_tracks_inside_one_video_when_possible(self) -> None:
+        generator = VariationGenerator()
+        clips = [
+            MusicClip(start_sec=0.0, end_sec=2.0, volume=1.0),
+            MusicClip(start_sec=3.0, end_sec=5.0, volume=1.0),
+        ]
+        variation_profile = VariationProfile(
+            speed_factor=1.0,
+            brightness_shift=0.0,
+            contrast_shift=0.0,
+            saturation_shift=0.0,
+            filter_preset="neutral_contrast",
+            trim_start=0.0,
+            trim_end=0.0,
+            output_duration=8.0,
+            target_duration=8.0,
+        )
+
+        assignments = generator._build_music_segments(
+            timeline_clips=clips,
+            variation_profile=variation_profile,
+            source_duration=8.0,
+            music_tracks=[Path("a.mp3"), Path("b.mp3"), Path("c.mp3")],
+            preferred_track=Path("b.mp3"),
+        )
+
+        self.assertEqual(assignments[0].track, Path("b.mp3"))
+        self.assertNotEqual(assignments[0].track, assignments[1].track)
 
 
 if __name__ == "__main__":

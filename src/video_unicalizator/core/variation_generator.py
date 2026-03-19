@@ -1,21 +1,19 @@
 from __future__ import annotations
 
 import logging
-import random
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from video_unicalizator.config import MIN_SHARPNESS_SCORE
 from video_unicalizator.core.quality_checker import QualityChecker, QualityReference, QualityReport
 from video_unicalizator.core.recipe_planner import (
     PlannedRecipeCandidate,
     SourceUniquenessLedger,
     VariationRecipePlanner,
 )
-from video_unicalizator.core.video_processor import VariationProfile, VideoProcessor
-from video_unicalizator.services.music_loader import MusicChoice, MusicRotation
+from video_unicalizator.core.video_processor import QuoteRenderSegment, VariationProfile, VideoProcessor
+from video_unicalizator.services.music_loader import MusicChoice, MusicRotation, QuoteChoice, QuoteRotation
 from video_unicalizator.state import (
     AppState,
     GeneratedVariation,
@@ -23,6 +21,10 @@ from video_unicalizator.state import (
     GenerationCancelledError,
     GenerationProgressEvent,
     GenerationSettings,
+    MusicClip,
+    QuoteClip,
+    RenderedMusicAssignment,
+    RenderedQuoteAssignment,
     VideoEditProfile,
 )
 from video_unicalizator.utils.ffmpeg_tools import ffmpeg_available
@@ -52,6 +54,8 @@ class RenderAttempt:
     secondary_quote: str
     music_track: Path | None
     snapshot: QualityReference | None
+    quote_assignments: list[RenderedQuoteAssignment] = field(default_factory=list)
+    music_assignments: list[RenderedMusicAssignment] = field(default_factory=list)
     soft_accepted: bool = False
 
 
@@ -86,8 +90,11 @@ class VariationGenerator:
         self.video_processor = VideoProcessor()
         self.quality_checker = QualityChecker()
         self.music_rotation = MusicRotation()
+        self.quote_rotation_a = QuoteRotation()
+        self.quote_rotation_b = QuoteRotation()
         self.logger = logging.getLogger(self.__class__.__name__)
         self.last_summary = GenerationRunSummary()
+        self._music_pick_count = 0
 
     def _notify(
         self,
@@ -176,6 +183,158 @@ class VariationGenerator:
             self._resolve_quote_pool(state.media.quotes_b, profile.layer_b.preview_text, profile.layer_b.enabled),
         )
 
+    def _map_clip_to_output(
+        self,
+        *,
+        clip_start: float,
+        clip_end: float,
+        profile: VariationProfile,
+        source_duration: float,
+    ) -> tuple[float, float] | None:
+        trimmed_end = max(profile.trim_start + 0.12, source_duration - profile.trim_end)
+        effective_start = max(clip_start, profile.trim_start)
+        effective_end = min(clip_end, trimmed_end)
+        if effective_end <= effective_start:
+            return None
+        output_start = (effective_start - profile.trim_start) / max(profile.speed_factor, 0.01)
+        output_end = (effective_end - profile.trim_start) / max(profile.speed_factor, 0.01)
+        if output_end <= output_start:
+            return None
+        return round(output_start, 3), round(output_end, 3)
+
+    def _pick_quote_for_clip(
+        self,
+        *,
+        lane: str,
+        clip: QuoteClip,
+        quote_pool: list[str],
+        fallback_text: str,
+        used_in_roll: set[str],
+    ) -> QuoteChoice:
+        if clip.source_mode == "pool" and quote_pool:
+            rotation = self.quote_rotation_a if lane == "A" else self.quote_rotation_b
+            return rotation.pick(quote_pool, used_in_roll=used_in_roll)
+        sample_text = (clip.sample_text or fallback_text).strip()
+        return QuoteChoice(text=sample_text, cycle_index=0, source_mode="sample")
+
+    def _build_quote_segments(
+        self,
+        *,
+        profile: VideoEditProfile,
+        variation_profile: VariationProfile,
+        source_duration: float,
+        primary_pool: list[str],
+        secondary_pool: list[str],
+    ) -> list[QuoteRenderSegment]:
+        segments: list[QuoteRenderSegment] = []
+        used_a: set[str] = set()
+        used_b: set[str] = set()
+
+        for clip in profile.timeline.quote_clips_a:
+            mapped = self._map_clip_to_output(
+                clip_start=clip.start_sec,
+                clip_end=clip.end_sec,
+                profile=variation_profile,
+                source_duration=source_duration,
+            )
+            if mapped is None or not clip.enabled or not profile.layer_a.enabled:
+                continue
+            choice = self._pick_quote_for_clip(
+                lane="A",
+                clip=clip,
+                quote_pool=primary_pool,
+                fallback_text=profile.layer_a.preview_text,
+                used_in_roll=used_a,
+            )
+            if not choice.text.strip():
+                continue
+            used_a.add(choice.text)
+            assignment = RenderedQuoteAssignment(
+                lane="A",
+                clip_id=clip.clip_id,
+                text=choice.text,
+                start_sec=mapped[0],
+                end_sec=mapped[1],
+                source_mode=choice.source_mode,
+                cycle_index=choice.cycle_index,
+            )
+            segments.append(QuoteRenderSegment(style=replace(profile.layer_a), assignment=assignment))
+
+        for clip in profile.timeline.quote_clips_b:
+            mapped = self._map_clip_to_output(
+                clip_start=clip.start_sec,
+                clip_end=clip.end_sec,
+                profile=variation_profile,
+                source_duration=source_duration,
+            )
+            if mapped is None or not clip.enabled or not profile.layer_b.enabled:
+                continue
+            choice = self._pick_quote_for_clip(
+                lane="B",
+                clip=clip,
+                quote_pool=secondary_pool,
+                fallback_text=profile.layer_b.preview_text,
+                used_in_roll=used_b,
+            )
+            if not choice.text.strip():
+                continue
+            used_b.add(choice.text)
+            assignment = RenderedQuoteAssignment(
+                lane="B",
+                clip_id=clip.clip_id,
+                text=choice.text,
+                start_sec=mapped[0],
+                end_sec=mapped[1],
+                source_mode=choice.source_mode,
+                cycle_index=choice.cycle_index,
+            )
+            segments.append(QuoteRenderSegment(style=replace(profile.layer_b), assignment=assignment))
+
+        return segments
+
+    def _build_music_segments(
+        self,
+        *,
+        timeline_clips: list[MusicClip],
+        variation_profile: VariationProfile,
+        source_duration: float,
+        music_tracks: list[Path],
+        preferred_track: Path | None,
+    ) -> list[RenderedMusicAssignment]:
+        assignments: list[RenderedMusicAssignment] = []
+        used_tracks: set[Path] = set()
+
+        for clip in timeline_clips:
+            mapped = self._map_clip_to_output(
+                clip_start=clip.start_sec,
+                clip_end=clip.end_sec,
+                profile=variation_profile,
+                source_duration=source_duration,
+            )
+            if mapped is None or not clip.enabled:
+                continue
+            preferred = preferred_track if not assignments else None
+            choice = self.music_rotation.pick(
+                music_tracks,
+                used_in_roll=used_tracks,
+                preferred_track=preferred,
+            )
+            if choice.track is None:
+                continue
+            used_tracks.add(choice.track)
+            assignments.append(
+                RenderedMusicAssignment(
+                    clip_id=clip.clip_id,
+                    track=choice.track,
+                    start_sec=mapped[0],
+                    end_sec=mapped[1],
+                    volume=clip.volume,
+                    source_mode="pool",
+                    cycle_index=choice.cycle_index,
+                )
+            )
+        return assignments
+
     def _warning_reason_codes(self, warnings: list[str]) -> list[str]:
         codes: list[str] = []
         for warning in warnings:
@@ -191,11 +350,6 @@ class VariationGenerator:
             else:
                 codes.append("other")
         return codes
-
-    def _pick_quote(self, pool: list[str], rng: random.Random) -> str:
-        if not pool:
-            return ""
-        return rng.choice(pool)
 
     def _recipe_message(self, candidate: PlannedRecipeCandidate) -> str:
         nearest = candidate.distance.nearest_recipe_key
@@ -246,7 +400,6 @@ class VariationGenerator:
         secondary_pool: list[str],
         planner: VariationRecipePlanner,
         ledger: SourceUniquenessLedger,
-        quote_rng: random.Random,
         cancel_token: GenerationCancelToken | None,
     ) -> RenderAttempt:
         self._check_cancel(cancel_token)
@@ -256,12 +409,14 @@ class VariationGenerator:
 
         last_render_error: Exception | None = None
         last_quality_report: QualityReport | None = None
+        normalized_profile = profile.normalized_for_duration(source_duration)
 
         for attempt_number in range(1, render_attempt_limit + 1):
             self._check_cancel(cancel_token)
-            music_choice: MusicChoice = self.music_rotation.preview_for_accept_index(
-                state.media.music_tracks,
-                self.last_summary.success_count,
+            music_choice = (
+                self.music_rotation.preview_for_accept_index(state.media.music_tracks, self._music_pick_count)
+                if normalized_profile.timeline.music_clips
+                else MusicChoice(track=None, cycle_index=0)
             )
             candidate = planner.next_recipe(ledger, music_choice)
             if candidate is None:
@@ -274,8 +429,28 @@ class VariationGenerator:
                 state=state,
                 source_duration=source_duration,
             )
-            primary_quote = self._pick_quote(primary_pool, quote_rng)
-            secondary_quote = self._pick_quote(secondary_pool, quote_rng)
+            quote_segments = self._build_quote_segments(
+                profile=normalized_profile,
+                variation_profile=variation_profile,
+                source_duration=source_duration,
+                primary_pool=primary_pool,
+                secondary_pool=secondary_pool,
+            )
+            music_segments = self._build_music_segments(
+                timeline_clips=normalized_profile.timeline.music_clips,
+                variation_profile=variation_profile,
+                source_duration=source_duration,
+                music_tracks=state.media.music_tracks,
+                preferred_track=music_choice.track,
+            )
+            primary_quote = next(
+                (segment.assignment.text for segment in quote_segments if segment.assignment.lane == "A"),
+                "",
+            )
+            secondary_quote = next(
+                (segment.assignment.text for segment in quote_segments if segment.assignment.lane == "B"),
+                "",
+            )
 
             attempt_output = self._build_output_path(
                 source_video,
@@ -342,12 +517,9 @@ class VariationGenerator:
                 self.video_processor.render_variation(
                     source_video=source_video,
                     output_video=attempt_output,
-                    quote_layers=[
-                        (replace(profile.layer_a, preview_text=primary_quote), primary_quote),
-                        (replace(profile.layer_b, preview_text=secondary_quote), secondary_quote),
-                    ],
+                    quote_segments=quote_segments,
+                    music_segments=music_segments,
                     profile=variation_profile,
-                    music_track=music_choice.track,
                     music_volume=state.generation.music_volume,
                     progress_callback=on_render_progress,
                     enhance_sharpness=state.generation.enhance_sharpness,
@@ -385,8 +557,10 @@ class VariationGenerator:
                     ),
                     primary_quote=primary_quote,
                     secondary_quote=secondary_quote,
-                    music_track=music_choice.track,
+                    music_track=music_segments[0].track if music_segments else None,
                     snapshot=None,
+                    quote_assignments=[replace(segment.assignment) for segment in quote_segments],
+                    music_assignments=[replace(segment) for segment in music_segments],
                 )
 
             def on_quality_progress(message: str, progress_ratio: float) -> None:
@@ -422,8 +596,10 @@ class VariationGenerator:
                     report=report,
                     primary_quote=primary_quote,
                     secondary_quote=secondary_quote,
-                    music_track=music_choice.track,
+                    music_track=music_segments[0].track if music_segments else None,
                     snapshot=snapshot,
+                    quote_assignments=[replace(segment.assignment) for segment in quote_segments],
+                    music_assignments=[replace(segment) for segment in music_segments],
                 )
 
             attempt_output.unlink(missing_ok=True)
@@ -468,6 +644,9 @@ class VariationGenerator:
     ) -> list[GeneratedVariation]:
         self._validate_state(state)
         self.music_rotation.reset()
+        self.quote_rotation_a.reset()
+        self.quote_rotation_b.reset()
+        self._music_pick_count = 0
         if cancel_token is not None and cancel_token.is_cancelled():
             self.last_summary = GenerationRunSummary(
                 requested_count=0,
@@ -503,7 +682,7 @@ class VariationGenerator:
             if width != 1080 or height != 1920:
                 self.logger.warning("Оригинал %s будет приведён к 1080x1920 при экспорте.", source_video.name)
 
-            profile = self._video_profile_for(state, source_video)
+            profile = self._video_profile_for(state, source_video).normalized_for_duration(source_duration)
             primary_pool, secondary_pool = self._resolve_quote_pools(state, profile)
             reference_snapshots: list[QualityReference] = []
             ledger = SourceUniquenessLedger()
@@ -513,7 +692,6 @@ class VariationGenerator:
                 settings=state.generation,
                 color_grade=state.color_grade,
             )
-            quote_rng = random.Random(f"{source_video}|{len(primary_pool)}|{len(secondary_pool)}")
             source_exhausted = False
 
             for variation_number in range(1, state.generation.variation_count + 1):
@@ -541,7 +719,6 @@ class VariationGenerator:
                         secondary_pool=secondary_pool,
                         planner=planner,
                         ledger=ledger,
-                        quote_rng=quote_rng,
                         cancel_token=cancel_token,
                     )
                 except GenerationCancelledError as error:
@@ -665,9 +842,12 @@ class VariationGenerator:
                         recipe_key=attempt.profile.recipe_key,
                         nearest_reference_video=attempt.report.nearest_reference_video,
                         nearest_distance_score=attempt.report.nearest_distance_score,
+                        quote_assignments=[replace(assignment) for assignment in attempt.quote_assignments],
+                        music_assignments=[replace(assignment) for assignment in attempt.music_assignments],
                     )
                 )
                 self.last_summary.success_count += 1
+                self._music_pick_count += len([assignment for assignment in attempt.music_assignments if assignment.track is not None])
                 if attempt.report.warnings:
                     self.last_summary.warning_count += 1
 

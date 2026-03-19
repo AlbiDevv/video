@@ -241,7 +241,7 @@ class DraggableTextOverlay:
             target_height = max(1, self._overlay_bounds_local.height)
             if overlay_crop.size != (target_width, target_height):
                 overlay_crop = overlay_crop.resize((target_width, target_height), Image.Resampling.LANCZOS)
-            self._display_photo = ImageTk.PhotoImage(overlay_crop)
+            self._display_photo = ImageTk.PhotoImage(overlay_crop, master=self.canvas)
             self._last_image_signature = image_signature
 
             global_bounds = self._local_to_canvas(self._overlay_bounds_local)

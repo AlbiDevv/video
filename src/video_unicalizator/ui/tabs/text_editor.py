@@ -7,13 +7,32 @@ from typing import Literal
 
 import customtkinter as ctk
 
-from video_unicalizator.config import DEFAULT_VARIATIONS, MAX_VARIATIONS, MIN_VARIATIONS
-from video_unicalizator.state import GenerationProgressEvent, TextStyle, VideoEditProfile
+from video_unicalizator.config import DEFAULT_VARIATIONS, MAX_VARIATIONS, MIN_VARIATIONS, TIMELINE_DEFAULT_PIXELS_PER_SECOND
+from video_unicalizator.ui.preview_controller import ManagedPreviewPlaybackController
+from video_unicalizator.state import (
+    EditorLayoutState,
+    GenerationProgressEvent,
+    MusicClip,
+    QuoteClip,
+    TextStyle,
+    TimelineLane,
+    VideoEditProfile,
+)
 from video_unicalizator.ui.widgets.color_picker import ColorPickerRow
 from video_unicalizator.ui.widgets.generation_console import GenerationConsole
+from video_unicalizator.ui.widgets.timeline_editor import TimelineEditorWidget
 from video_unicalizator.ui.widgets.video_preview import VideoPreviewWidget
 
 LayerKey = Literal["A", "B"]
+
+
+@dataclass(slots=True)
+class VideoWorkspaceState:
+    playhead_sec: float = 0.0
+    timeline_zoom: float = float(TIMELINE_DEFAULT_PIXELS_PER_SECOND)
+    timeline_scroll: float = 0.0
+    selected_lane: TimelineLane | None = None
+    selected_clip_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -36,6 +55,16 @@ class LayerSectionControls:
     corner_radius_slider: ctk.CTkSlider
     shadow_label: ctk.CTkLabel
     shadow_slider: ctk.CTkSlider
+    clip_status_label: ctk.CTkLabel
+
+
+@dataclass(slots=True)
+class MusicSectionControls:
+    frame: ctk.CTkFrame
+    clip_status_label: ctk.CTkLabel
+    volume_label: ctk.CTkLabel
+    volume_slider: ctk.CTkSlider
+    helper_label: ctk.CTkLabel
 
 
 class TextEditorTab(ctk.CTkFrame):
@@ -75,42 +104,160 @@ class TextEditorTab(ctk.CTkFrame):
         self._suspend_callbacks = False
         self._focused_layer: LayerKey = "A"
         self._current_profile = VideoEditProfile()
+        self._current_duration = 0.0
         self._original_paths: list[Path] = []
+        self._music_tracks: list[Path] = []
+        self._selected_video_path: Path | None = None
         self._selected_video_index = 0
+        self._selected_clip_lane: TimelineLane | None = None
+        self._selected_clip_id: str | None = None
+        self._layout_state = EditorLayoutState()
+        self._video_workspace_state: dict[str, VideoWorkspaceState] = {}
+        self._last_drawer_compact_state: bool | None = None
+        self._layout_resize_after_id: str | None = None
 
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=0)
-        self.grid_columnconfigure(0, weight=0)
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_columnconfigure(2, weight=0)
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
 
-        self.left_panel = ctk.CTkScrollableFrame(
+        self.workspace_toolbar = ctk.CTkFrame(
             self,
-            width=356,
+            fg_color="#08111f",
+            corner_radius=18,
+            border_width=1,
+            border_color="#16253c",
+        )
+        self.workspace_toolbar.grid(row=0, column=0, padx=12, pady=(10, 8), sticky="ew")
+        self.workspace_toolbar.grid_columnconfigure(1, weight=1)
+
+        self.workspace_title = ctk.CTkLabel(
+            self.workspace_toolbar,
+            text="Монтажная студия",
+            font=ctk.CTkFont(family="Bahnschrift", size=18, weight="bold"),
+            text_color="#f8fafc",
+        )
+        self.workspace_title.grid(row=0, column=0, padx=(14, 8), pady=10, sticky="w")
+
+        nav_frame = ctk.CTkFrame(self.workspace_toolbar, fg_color="transparent")
+        nav_frame.grid(row=0, column=1, pady=8, sticky="w")
+        self.prev_video_button = ctk.CTkButton(nav_frame, text="Prev", width=58, height=30, command=self._select_prev_video)
+        self.prev_video_button.grid(row=0, column=0, padx=(0, 6))
+        self.current_video_label = ctk.CTkLabel(
+            nav_frame,
+            text="Видео не выбрано",
+            text_color="#f8fafc",
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+        )
+        self.current_video_label.grid(row=0, column=1, padx=(0, 6), sticky="w")
+        self.next_video_button = ctk.CTkButton(nav_frame, text="Next", width=58, height=30, command=self._select_next_video)
+        self.next_video_button.grid(row=0, column=2, padx=(0, 10))
+
+        actions_frame = ctk.CTkFrame(self.workspace_toolbar, fg_color="transparent")
+        actions_frame.grid(row=0, column=2, padx=(8, 10), pady=8, sticky="e")
+
+        self.generate_button = ctk.CTkButton(
+            actions_frame,
+            text="Рендер",
+            command=self._on_generate,
+            width=96,
+            height=32,
+            corner_radius=12,
+            fg_color="#f97316",
+            hover_color="#ea580c",
+        )
+        self.generate_button.grid(row=0, column=0, padx=(0, 6))
+
+        self.stop_generation_button = ctk.CTkButton(
+            actions_frame,
+            text="Стоп",
+            command=self._on_stop_generation,
+            width=74,
+            height=32,
+            corner_radius=12,
+            fg_color="#991b1b",
+            hover_color="#b91c1c",
+            state="disabled",
+        )
+        self.stop_generation_button.grid(row=0, column=1, padx=(0, 10))
+
+        toggle_frame = ctk.CTkFrame(self.workspace_toolbar, fg_color="transparent")
+        toggle_frame.grid(row=0, column=3, padx=(0, 14), pady=8, sticky="e")
+        self.media_toggle_button = ctk.CTkButton(toggle_frame, text="Медиа", width=78, height=30, command=self._toggle_media_rail)
+        self.media_toggle_button.grid(row=0, column=0, padx=(0, 6))
+        self.inspector_toggle_button = ctk.CTkButton(toggle_frame, text="Инспектор", width=92, height=30, command=self._toggle_inspector)
+        self.inspector_toggle_button.grid(row=0, column=1, padx=(0, 6))
+        self.timeline_toggle_button = ctk.CTkButton(toggle_frame, text="Timeline", width=82, height=30, command=self._toggle_timeline)
+        self.timeline_toggle_button.grid(row=0, column=2, padx=(0, 6))
+        self.console_toggle_button = ctk.CTkButton(toggle_frame, text="Лог", width=62, height=30, command=self._toggle_console)
+        self.console_toggle_button.grid(row=0, column=3)
+
+        self.main_pane = tk.PanedWindow(
+            self,
+            orient="horizontal",
+            sashwidth=8,
+            bd=0,
+            relief="flat",
+            bg="#050914",
+            opaqueresize=True,
+        )
+        self.main_pane.grid(row=1, column=0, padx=12, pady=(0, 8), sticky="nsew")
+
+        self.left_shell = ctk.CTkFrame(self.main_pane, fg_color="transparent")
+        self.left_shell.grid_rowconfigure(0, weight=1)
+        self.left_shell.grid_columnconfigure(0, weight=1)
+        self.left_panel = ctk.CTkScrollableFrame(
+            self.left_shell,
+            width=getattr(self._layout_state, "media_rail_width", 280),
             corner_radius=18,
             fg_color="#0b1320",
             border_width=1,
             border_color="#16253c",
         )
-        self.left_panel.grid(row=0, column=0, padx=(12, 8), pady=(10, 8), sticky="ns")
+        self.left_panel.grid(row=0, column=0, sticky="nsew")
         self.left_panel.grid_columnconfigure(0, weight=1)
 
+        self.center_host = ctk.CTkFrame(self.main_pane, fg_color="transparent")
+        self.center_host.grid_rowconfigure(0, weight=1)
+        self.center_host.grid_columnconfigure(0, weight=1)
+
+        self.center_pane = tk.PanedWindow(
+            self.center_host,
+            orient="vertical",
+            sashwidth=8,
+            bd=0,
+            relief="flat",
+            bg="#050914",
+            opaqueresize=True,
+        )
+        self.center_pane.grid(row=0, column=0, sticky="nsew")
+
         self.preview = VideoPreviewWidget(
-            self,
+            self.center_pane,
             on_overlay_change=self._handle_overlay_change,
             on_overlay_focus=self._handle_overlay_focus,
+            on_time_change=self._handle_preview_time_change,
         )
-        self.preview.grid(row=0, column=1, padx=8, pady=(10, 8), sticky="nsew")
 
+        self.timeline = TimelineEditorWidget(
+            self.center_pane,
+            on_timeline_change=self._handle_timeline_change,
+            on_playhead_change=self._handle_timeline_playhead_change,
+            on_lane_focus=self._handle_timeline_lane_focus,
+            on_selection_change=self._handle_timeline_selection_change,
+            height=self._layout_state.timeline_height,
+        )
+
+        self.right_shell = ctk.CTkFrame(self.main_pane, fg_color="transparent")
+        self.right_shell.grid_rowconfigure(0, weight=1)
+        self.right_shell.grid_columnconfigure(0, weight=1)
         self.right_panel = ctk.CTkScrollableFrame(
-            self,
-            width=290,
+            self.right_shell,
+            width=self._layout_state.inspector_width,
             corner_radius=18,
             fg_color="#0b1320",
             border_width=1,
             border_color="#16253c",
         )
-        self.right_panel.grid(row=0, column=2, padx=(8, 12), pady=(10, 8), sticky="ns")
+        self.right_panel.grid(row=0, column=0, sticky="nsew")
         self.right_panel.grid_columnconfigure(0, weight=1)
 
         self.generation_console = GenerationConsole(
@@ -119,9 +266,11 @@ class TextEditorTab(ctk.CTkFrame):
             compact=True,
             start_collapsed=True,
         )
-        self.generation_console.grid(row=1, column=0, columnspan=3, padx=12, pady=(0, 12), sticky="ew")
+        self.generation_console.grid(row=2, column=0, padx=12, pady=(0, 12), sticky="ew")
+        if not self._layout_state.console_visible:
+            self.generation_console.grid_remove()
 
-        self._build_left_panel(
+        self._build_media_rail(
             on_load_originals_files,
             on_load_originals_folder,
             on_load_music_files,
@@ -132,9 +281,140 @@ class TextEditorTab(ctk.CTkFrame):
             on_load_quotes_b_folder,
             on_choose_output_folder,
         )
-        self._build_right_panel()
+        self._build_inspector()
+        self._playback_controller = ManagedPreviewPlaybackController(
+            preview_widget=self.preview,
+            get_timeline=lambda: self._current_profile.timeline.copy(),
+            get_music_tracks=lambda: list(self._music_tracks),
+            get_music_preview_settings=self.preview.read_music_preview_settings,
+        )
+        self.preview.set_playback_controller(self._playback_controller)
+        self.main_pane.bind("<ButtonRelease-1>", lambda _event: self.after_idle(self._remember_layout_state))
+        self.center_pane.bind("<ButtonRelease-1>", lambda _event: self.after_idle(self._remember_layout_state))
+        self.bind("<Configure>", self._schedule_layout_refresh)
+        self._apply_workspace_layout()
         self.load_profile(VideoEditProfile())
+        self._sync_toggle_buttons()
         self._refresh_original_actions()
+
+    def _pane_present(self, pane: tk.PanedWindow, widget) -> bool:
+        return str(widget) in pane.panes()
+
+    def _apply_workspace_layout(self) -> None:
+        compact_mode = (self.winfo_width() or 0) < 1380
+        effective_media_visible = self._layout_state.media_rail_visible
+        effective_inspector_visible = self._layout_state.inspector_visible and not compact_mode
+
+        self.left_panel.configure(width=self._layout_state.media_rail_width)
+        self.right_panel.configure(width=self._layout_state.inspector_width)
+        self.timeline.configure(height=self._layout_state.timeline_height)
+
+        if self._pane_present(self.center_pane, self.preview):
+            self.center_pane.forget(self.preview)
+        if self._pane_present(self.center_pane, self.timeline):
+            self.center_pane.forget(self.timeline)
+        self.center_pane.add(self.preview, minsize=360)
+        if self._layout_state.timeline_visible:
+            self.center_pane.add(self.timeline, minsize=220)
+
+        if self._pane_present(self.main_pane, self.left_shell):
+            self.main_pane.forget(self.left_shell)
+        if self._pane_present(self.main_pane, self.center_host):
+            self.main_pane.forget(self.center_host)
+        if self._pane_present(self.main_pane, self.right_shell):
+            self.main_pane.forget(self.right_shell)
+
+        if effective_media_visible:
+            self.main_pane.add(self.left_shell, minsize=220)
+        self.main_pane.add(self.center_host, minsize=680)
+        if effective_inspector_visible:
+            self.main_pane.add(self.right_shell, minsize=260)
+
+        if self._layout_state.console_visible:
+            self.generation_console.grid()
+            self.generation_console.set_expanded(True)
+        else:
+            self.generation_console.grid_remove()
+        self._last_drawer_compact_state = compact_mode
+        self.after_idle(self._remember_layout_state)
+
+    def _remember_layout_state(self) -> None:
+        if self._layout_state.media_rail_visible and self.left_panel.winfo_exists():
+            self._layout_state.media_rail_width = max(220, self.left_shell.winfo_width())
+        if self._layout_state.inspector_visible and self.right_panel.winfo_exists() and self._pane_present(self.main_pane, self.right_shell):
+            self._layout_state.inspector_width = max(260, self.right_shell.winfo_width())
+        if self._layout_state.timeline_visible and self.timeline.winfo_exists():
+            self._layout_state.timeline_height = max(220, self.timeline.winfo_height())
+
+    def _sync_toggle_buttons(self) -> None:
+        compact_mode = (self.winfo_width() or 0) < 1380
+        button_map = (
+            (self.media_toggle_button, self._layout_state.media_rail_visible),
+            (self.inspector_toggle_button, self._layout_state.inspector_visible and not compact_mode),
+            (self.timeline_toggle_button, self._layout_state.timeline_visible),
+            (self.console_toggle_button, self._layout_state.console_visible),
+        )
+        for button, enabled in button_map:
+            button.configure(
+                fg_color="#2563eb" if enabled else "#16253c",
+                hover_color="#1d4ed8" if enabled else "#1d3557",
+            )
+
+    def _toggle_media_rail(self) -> None:
+        self._layout_state.media_rail_visible = not self._layout_state.media_rail_visible
+        self._apply_workspace_layout()
+        self._sync_toggle_buttons()
+
+    def _toggle_inspector(self) -> None:
+        self._layout_state.inspector_visible = not self._layout_state.inspector_visible
+        self._apply_workspace_layout()
+        self._sync_toggle_buttons()
+
+    def _toggle_timeline(self) -> None:
+        self._layout_state.timeline_visible = not self._layout_state.timeline_visible
+        self._apply_workspace_layout()
+        self._sync_toggle_buttons()
+
+    def _toggle_console(self) -> None:
+        self._layout_state.console_visible = not self._layout_state.console_visible
+        self._apply_workspace_layout()
+        self._sync_toggle_buttons()
+
+    def _schedule_layout_refresh(self, _event=None) -> None:
+        if self._layout_resize_after_id is not None:
+            self.after_cancel(self._layout_resize_after_id)
+        self._layout_resize_after_id = self.after(90, self._refresh_layout_on_resize)
+
+    def _refresh_layout_on_resize(self) -> None:
+        self._layout_resize_after_id = None
+        compact_mode = (self.winfo_width() or 0) < 1380
+        if compact_mode != self._last_drawer_compact_state:
+            self._apply_workspace_layout()
+
+    def _capture_workspace_state(self) -> None:
+        if self._selected_video_path is None:
+            return
+        self._video_workspace_state[str(self._selected_video_path)] = VideoWorkspaceState(
+            playhead_sec=self.preview.get_playhead(),
+            timeline_zoom=self.timeline.read_view_state()[0],
+            timeline_scroll=self.timeline.read_view_state()[1],
+            selected_lane=self._selected_clip_lane,
+            selected_clip_id=self._selected_clip_id,
+        )
+
+    def _restore_workspace_state(self) -> None:
+        if self._selected_video_path is None:
+            return
+        state = self._video_workspace_state.get(str(self._selected_video_path))
+        if state is None:
+            return
+        self.timeline.set_view_state(pixels_per_second=state.timeline_zoom, scroll_fraction=state.timeline_scroll)
+        self.preview.set_playhead(state.playhead_sec)
+        self._selected_clip_lane = state.selected_lane
+        self._selected_clip_id = state.selected_clip_id
+        if state.selected_lane in {"A", "B"}:
+            self._focus_layer(state.selected_lane, refresh=False)
+        self._refresh_inspector()
 
     def _section_title(self, parent, row: int, title: str, subtitle: str | None = None) -> int:
         ctk.CTkLabel(
@@ -201,7 +481,7 @@ class TextEditorTab(ctk.CTkFrame):
         folder_button.grid(row=1, column=1, padx=(5, 10), pady=(0, 10), sticky="ew")
         return row + 1, files_button, folder_button
 
-    def _build_left_panel(
+    def _build_media_rail(
         self,
         on_load_originals_files,
         on_load_originals_folder,
@@ -217,9 +497,66 @@ class TextEditorTab(ctk.CTkFrame):
         row = self._section_title(
             self.left_panel,
             row,
-            "Ресурсы",
-            "Можно загружать по файлам или целыми папками. Для каждого видео хранится свой макет двух независимых слоёв A/B.",
+            "Медиатека",
+            "Только ресурсы проекта: видео, музыка, txt-пулы и папка вывода. Монтаж и настройки живут в центре и справа.",
         )
+
+        self.drawer_video_label = ctk.CTkLabel(
+            self.left_panel,
+            text="Видео не выбрано",
+            text_color="#f8fafc",
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+        )
+        self.drawer_video_label.grid(row=row, column=0, padx=14, pady=(0, 6), sticky="w")
+        row += 1
+
+        self.inspector_summary = ctk.CTkLabel(
+            self.left_panel,
+            text="Оригиналы: 0\nМузыка: 0\nЦитаты A: 0\nЦитаты B: 0",
+            justify="left",
+            anchor="w",
+            text_color="#9fb3cf",
+        )
+        self.inspector_summary.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
+        row += 1
+
+        self.list_title = ctk.CTkLabel(
+            self.left_panel,
+            text="Видео проекта",
+            font=ctk.CTkFont(family="Bahnschrift", size=16, weight="bold"),
+            text_color="#f8fafc",
+        )
+        self.list_title.grid(row=row, column=0, padx=14, pady=(0, 6), sticky="w")
+        row += 1
+
+        self.listbox = tk.Listbox(
+            self.left_panel,
+            bg="#09111f",
+            fg="#e2e8f0",
+            selectbackground="#2563eb",
+            activestyle="none",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Segoe UI", 11),
+            height=10,
+        )
+        self.listbox.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
+        self.listbox.bind("<<ListboxSelect>>", self._handle_video_selected)
+        self.listbox.bind("<Delete>", self._handle_delete_pressed)
+        row += 1
+
+        self.remove_original_button = ctk.CTkButton(
+            self.left_panel,
+            text="Удалить из проекта",
+            command=self._on_remove_original,
+            height=36,
+            corner_radius=12,
+            fg_color="#7f1d1d",
+            hover_color="#991b1b",
+            state="disabled",
+        )
+        self.remove_original_button.grid(row=row, column=0, padx=14, pady=(0, 14), sticky="ew")
+        row += 1
 
         row, self.originals_files_button, self.originals_folder_button = self._resource_row(
             self.left_panel,
@@ -249,7 +586,7 @@ class TextEditorTab(ctk.CTkFrame):
             on_load_quotes_a_folder,
             "txt для A",
             "Папка",
-            "#7c3aed",
+            "#2563eb",
         )
         row, self.quotes_b_files_button, self.quotes_b_folder_button = self._resource_row(
             self.left_panel,
@@ -279,106 +616,107 @@ class TextEditorTab(ctk.CTkFrame):
             text="output",
             text_color="#cbd5e1",
             justify="left",
-            wraplength=318,
+            wraplength=248,
         )
-        self.output_label.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="w")
+        self.output_label.grid(row=row, column=0, padx=14, pady=(0, 6), sticky="w")
         row += 1
 
-        row = self._section_title(
+        self.output_status = ctk.CTkLabel(
             self.left_panel,
-            row,
-            "Цитаты поверх кадра",
-            "Оба блока видны одновременно. Клик по цитате в превью подсвечивает её блок настроек слева.",
+            text="Вывод: output",
+            text_color="#8ea2c0",
+            justify="left",
+            wraplength=248,
         )
-        row, self.layer_sections = self._build_layer_sections(row)
-
-        row = self._section_title(self.left_panel, row, "Генерация", "Эти параметры общие для всего запуска.")
-
-        self.variation_label = ctk.CTkLabel(
-            self.left_panel,
-            text=f"Вариаций на оригинал: {DEFAULT_VARIATIONS}",
-            text_color="#dbe4f0",
-        )
-        self.variation_label.grid(row=row, column=0, padx=14, pady=(0, 4), sticky="w")
+        self.output_status.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="w")
         row += 1
 
-        self.variation_slider = ctk.CTkSlider(
+        self.ffmpeg_status_label = ctk.CTkLabel(
             self.left_panel,
-            from_=MIN_VARIATIONS,
-            to=MAX_VARIATIONS,
-            number_of_steps=MAX_VARIATIONS - MIN_VARIATIONS,
-            command=self._on_variation_changed,
-            progress_color="#ec4899",
+            text="FFmpeg: проверка...",
+            text_color="#8ea2c0",
+            justify="left",
+            wraplength=248,
         )
-        self.variation_slider.grid(row=row, column=0, padx=14, pady=(0, 8), sticky="ew")
-        row += 1
+        self.ffmpeg_status_label.grid(row=row, column=0, padx=14, pady=(0, 14), sticky="w")
 
-        self.enhance_sharpness_switch = ctk.CTkSwitch(
-            self.left_panel,
-            text="Повысить чёткость при рендере",
-            command=self._emit_profile_change,
-            progress_color="#22c55e",
-        )
-        self.enhance_sharpness_switch.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="w")
-        row += 1
-
-        buttons = ctk.CTkFrame(self.left_panel, fg_color="transparent")
-        buttons.grid(row=row, column=0, padx=14, pady=(0, 14), sticky="ew")
-        buttons.grid_columnconfigure(0, weight=1)
-
-        self.apply_button = ctk.CTkButton(
-            buttons,
-            text="Применить ко всем",
-            command=self._on_apply_style,
-            height=38,
-            corner_radius=12,
-            fg_color="#2563eb",
-            hover_color="#1d4ed8",
-        )
-        self.apply_button.grid(row=0, column=0, sticky="ew")
-
-        self.generate_button = ctk.CTkButton(
-            buttons,
-            text="Начать генерацию",
-            command=self._on_generate,
-            height=38,
-            corner_radius=12,
-            fg_color="#f97316",
-            hover_color="#ea580c",
-        )
-        self.generate_button.grid(row=1, column=0, pady=(8, 0), sticky="ew")
-
-        self.stop_generation_button = ctk.CTkButton(
-            buttons,
-            text="Остановить",
-            command=self._on_stop_generation,
-            height=38,
-            corner_radius=12,
-            fg_color="#991b1b",
-            hover_color="#b91c1c",
-            state="disabled",
-        )
-        self.stop_generation_button.grid(row=2, column=0, pady=(8, 0), sticky="ew")
-
-    def _build_layer_sections(self, row: int) -> tuple[int, dict[LayerKey, LayerSectionControls]]:
+    def _build_layer_sections(self, parent, row: int) -> tuple[int, dict[LayerKey, LayerSectionControls]]:
         sections: dict[LayerKey, LayerSectionControls] = {}
         row, sections["A"] = self._build_layer_section(
-            self.left_panel,
+            parent,
             row,
             key="A",
             title="Цитата A",
             accent="#2563eb",
-            subtitle="Если txt-пул A не загружен, в генерацию пойдёт этот sample-текст. Пустой текст выключает слой.",
+            subtitle="Основная дорожка цитаты. Если txt-пул не загружен, генерация берёт sample-текст отсюда.",
         )
         row, sections["B"] = self._build_layer_section(
-            self.left_panel,
+            parent,
             row,
             key="B",
             title="Цитата B",
             accent="#ec4899",
-            subtitle="Второй независимый слой. Можно использовать второй txt-пул или свой fallback sample.",
+            subtitle="Вторая независимая дорожка. Удобно для call-to-action или нижней подписи.",
         )
         return row, sections
+
+    def _build_music_section(self, parent, row: int) -> tuple[int, MusicSectionControls]:
+        frame = ctk.CTkFrame(
+            parent,
+            fg_color="#0f1b31",
+            corner_radius=16,
+            border_width=1,
+            border_color="#16253c",
+        )
+        frame.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
+        frame.grid_columnconfigure(0, weight=1)
+        row += 1
+
+        ctk.CTkLabel(
+            frame,
+            text="Музыка",
+            font=ctk.CTkFont(family="Bahnschrift", size=16, weight="bold"),
+            text_color="#f8fafc",
+        ).grid(row=0, column=0, padx=12, pady=(12, 2), sticky="w")
+
+        helper_label = ctk.CTkLabel(
+            frame,
+            text="Здесь настраивается только выбранный музыкальный клип. Источник трека всё ещё назначается автоматически по правилу unused first.",
+            text_color="#8ea2c0",
+            wraplength=270,
+            justify="left",
+        )
+        helper_label.grid(row=1, column=0, padx=12, pady=(0, 10), sticky="w")
+
+        clip_status_label = ctk.CTkLabel(
+            frame,
+            text="Клипы: 0",
+            text_color="#dbe4f0",
+            justify="left",
+            anchor="w",
+        )
+        clip_status_label.grid(row=2, column=0, padx=12, pady=(0, 6), sticky="ew")
+
+        volume_label = ctk.CTkLabel(frame, text="Громкость выбранного клипа: 100%", text_color="#dbe4f0")
+        volume_label.grid(row=3, column=0, padx=12, pady=(0, 4), sticky="w")
+
+        volume_slider = ctk.CTkSlider(
+            frame,
+            from_=0.0,
+            to=1.5,
+            number_of_steps=150,
+            command=self._on_music_volume_changed,
+            progress_color="#0f766e",
+        )
+        volume_slider.grid(row=4, column=0, padx=12, pady=(0, 12), sticky="ew")
+
+        return row, MusicSectionControls(
+            frame=frame,
+            clip_status_label=clip_status_label,
+            volume_label=volume_label,
+            volume_slider=volume_slider,
+            helper_label=helper_label,
+        )
 
     def _build_layer_section(
         self,
@@ -413,7 +751,7 @@ class TextEditorTab(ctk.CTkFrame):
             frame,
             text=subtitle,
             text_color="#8ea2c0",
-            wraplength=294,
+            wraplength=270,
             justify="left",
         ).grid(row=1, column=0, padx=12, pady=(0, 8), sticky="w")
 
@@ -424,6 +762,14 @@ class TextEditorTab(ctk.CTkFrame):
             progress_color=accent,
         )
         enabled_switch.grid(row=2, column=0, padx=12, pady=(0, 8), sticky="w")
+
+        clip_status_label = ctk.CTkLabel(
+            frame,
+            text="Клипы: 0",
+            text_color="#8ea2c0",
+            justify="left",
+        )
+        clip_status_label.grid(row=2, column=0, padx=(160, 12), pady=(0, 8), sticky="e")
 
         sample_quote_box = ctk.CTkTextbox(
             frame,
@@ -542,95 +888,136 @@ class TextEditorTab(ctk.CTkFrame):
             corner_radius_slider=corner_radius_slider,
             shadow_label=shadow_label,
             shadow_slider=shadow_slider,
+            clip_status_label=clip_status_label,
         )
 
-    def _build_right_panel(self) -> None:
+    def _build_inspector(self) -> None:
         row = 0
         row = self._section_title(
             self.right_panel,
             row,
-            "Video Inspector",
-            "Быстрая навигация по исходникам, состоянию слоёв и текущей папке результата.",
+            "Инспектор",
+            "Справа показываются только свойства выбранной дорожки или клипа. Выбор идёт от клика по цитате на stage или по клипу на timeline.",
         )
 
-        nav_frame = ctk.CTkFrame(self.right_panel, fg_color="#0f1b31", corner_radius=14)
-        nav_frame.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
-        nav_frame.grid_columnconfigure(1, weight=1)
-        self.prev_video_button = ctk.CTkButton(nav_frame, text="Prev", width=60, command=self._select_prev_video)
-        self.prev_video_button.grid(row=0, column=0, padx=(10, 6), pady=10)
-        self.current_video_label = ctk.CTkLabel(nav_frame, text="Видео не выбрано", text_color="#f8fafc")
-        self.current_video_label.grid(row=0, column=1, padx=6, pady=10, sticky="w")
-        self.next_video_button = ctk.CTkButton(nav_frame, text="Next", width=60, command=self._select_next_video)
-        self.next_video_button.grid(row=0, column=2, padx=(6, 10), pady=10)
-        row += 1
-
-        self.inspector_summary = ctk.CTkLabel(
+        self.inspector_context_label = ctk.CTkLabel(
             self.right_panel,
-            text="Оригиналы: 0\nМузыка: 0\nЦитаты A: 0\nЦитаты B: 0",
-            justify="left",
-            anchor="w",
-            text_color="#cbd5e1",
+            text="Ничего не выбрано",
+            text_color="#f8fafc",
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
         )
-        self.inspector_summary.grid(row=row, column=0, padx=14, pady=(0, 10), sticky="ew")
+        self.inspector_context_label.grid(row=row, column=0, padx=14, pady=(0, 6), sticky="w")
         row += 1
 
         self.layer_status = ctk.CTkLabel(
             self.right_panel,
-            text="Слои:\nA: выкл\nB: выкл",
+            text="Выделите Цитату A, Цитату B или музыкальный клип, чтобы увидеть только его параметры.",
             justify="left",
             anchor="w",
             text_color="#cbd5e1",
+            wraplength=286,
         )
         self.layer_status.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
         row += 1
 
-        self.output_status = ctk.CTkLabel(
+        self.context_help_frame = ctk.CTkFrame(
             self.right_panel,
-            text="Вывод: output",
-            justify="left",
-            anchor="w",
-            text_color="#cbd5e1",
-            wraplength=240,
+            fg_color="#0f1b31",
+            corner_radius=16,
+            border_width=1,
+            border_color="#16253c",
         )
-        self.output_status.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
-        row += 1
-
-        self.list_title = ctk.CTkLabel(
-            self.right_panel,
-            text="Исходники",
-            font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+        self.context_help_frame.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
+        self.context_help_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            self.context_help_frame,
+            text="Подсказка",
+            font=ctk.CTkFont(family="Bahnschrift", size=16, weight="bold"),
             text_color="#f8fafc",
+        ).grid(row=0, column=0, padx=12, pady=(12, 4), sticky="w")
+        self.context_help_label = ctk.CTkLabel(
+            self.context_help_frame,
+            text="Кликните по цитате на stage, по дорожке A/B или по music clip на timeline. Инспектор покажет только нужные параметры.",
+            text_color="#8ea2c0",
+            justify="left",
+            wraplength=270,
         )
-        self.list_title.grid(row=row, column=0, padx=14, pady=(0, 6), sticky="w")
+        self.context_help_label.grid(row=1, column=0, padx=12, pady=(0, 12), sticky="w")
         row += 1
 
-        self.listbox = tk.Listbox(
+        row, self.layer_sections = self._build_layer_sections(self.right_panel, row)
+        row, self.music_section = self._build_music_section(self.right_panel, row)
+        self.layer_sections["A"].frame.grid_remove()
+        self.layer_sections["B"].frame.grid_remove()
+        self.music_section.frame.grid_remove()
+
+        export_frame = ctk.CTkFrame(
             self.right_panel,
-            bg="#09111f",
-            fg="#e2e8f0",
-            selectbackground="#2563eb",
-            activestyle="none",
-            borderwidth=0,
-            highlightthickness=0,
-            font=("Segoe UI", 11),
-            height=13,
+            fg_color="#0f1b31",
+            corner_radius=16,
+            border_width=1,
+            border_color="#16253c",
         )
-        self.listbox.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
-        self.listbox.bind("<<ListboxSelect>>", self._handle_video_selected)
-        self.listbox.bind("<Delete>", self._handle_delete_pressed)
+        export_frame.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
+        export_frame.grid_columnconfigure(0, weight=1)
         row += 1
 
-        self.remove_original_button = ctk.CTkButton(
-            self.right_panel,
-            text="Удалить из проекта",
-            command=self._on_remove_original,
-            height=36,
+        ctk.CTkLabel(
+            export_frame,
+            text="Экспорт",
+            font=ctk.CTkFont(family="Bahnschrift", size=16, weight="bold"),
+            text_color="#f8fafc",
+        ).grid(row=0, column=0, padx=12, pady=(12, 4), sticky="w")
+
+        self.variation_label = ctk.CTkLabel(
+            export_frame,
+            text=f"Вариаций на оригинал: {DEFAULT_VARIATIONS}",
+            text_color="#dbe4f0",
+        )
+        self.variation_label.grid(row=1, column=0, padx=12, pady=(0, 4), sticky="w")
+
+        self.variation_slider = ctk.CTkSlider(
+            export_frame,
+            from_=MIN_VARIATIONS,
+            to=MAX_VARIATIONS,
+            number_of_steps=MAX_VARIATIONS - MIN_VARIATIONS,
+            command=self._on_variation_changed,
+            progress_color="#ec4899",
+        )
+        self.variation_slider.grid(row=2, column=0, padx=12, pady=(0, 8), sticky="ew")
+
+        self.enhance_sharpness_switch = ctk.CTkSwitch(
+            export_frame,
+            text="Повысить чёткость при рендере",
+            command=self._emit_profile_change,
+            progress_color="#22c55e",
+        )
+        self.enhance_sharpness_switch.grid(row=3, column=0, padx=12, pady=(0, 12), sticky="w")
+
+        self.apply_button = ctk.CTkButton(
+            export_frame,
+            text="Применить макет ко всем видео",
+            command=self._on_apply_style,
+            height=38,
             corner_radius=12,
-            fg_color="#7f1d1d",
-            hover_color="#991b1b",
-            state="disabled",
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
         )
-        self.remove_original_button.grid(row=row, column=0, padx=14, pady=(0, 12), sticky="ew")
+        self.apply_button.grid(row=4, column=0, padx=12, pady=(0, 12), sticky="ew")
+
+    def _show_inspector_section(self, section: str | None) -> None:
+        frame_map = {
+            "A": self.layer_sections["A"].frame,
+            "B": self.layer_sections["B"].frame,
+            "Music": self.music_section.frame,
+            "Help": self.context_help_frame,
+        }
+        target = section if section in frame_map else "Help"
+        for name, frame in frame_map.items():
+            if name == target:
+                frame.grid()
+            else:
+                frame.grid_remove()
 
     def _get_layer_style(self, layer: LayerKey) -> TextStyle:
         return self._current_profile.layer_a if layer == "A" else self._current_profile.layer_b
@@ -709,21 +1096,34 @@ class TextEditorTab(ctk.CTkFrame):
     def _handle_section_change(self, layer: LayerKey) -> None:
         if self._suspend_callbacks:
             return
-        self._focus_layer(layer)
+        self._focus_layer(layer, refresh=False)
         style = self._sync_layer_from_section(layer)
+        self._sync_lane_sample_to_timeline(layer, style.preview_text)
+        self.timeline.set_lane_defaults(
+            lane_a_text=self._current_profile.layer_a.preview_text,
+            lane_b_text=self._current_profile.layer_b.preview_text,
+        )
         self._update_section_labels(layer, style)
         self._emit_profile_change()
 
-    def _emit_profile_change(self) -> None:
+    def _emit_profile_change(self, *, refresh_timeline: bool = True) -> None:
         if self._suspend_callbacks:
             return
         self._sync_all_sections_to_profile()
+        preview_duration = self._current_duration or self._current_profile.timeline.duration_hint or 12.0
+        self._current_profile = self._current_profile.normalized_for_duration(preview_duration)
         self.preview.load_profile(self._current_profile)
         self.preview.set_active_layer(self._focused_layer)
+        if refresh_timeline:
+            self.timeline.set_lane_defaults(
+                lane_a_text=self._current_profile.layer_a.preview_text,
+                lane_b_text=self._current_profile.layer_b.preview_text,
+            )
+            self.timeline.load_timeline(self._current_profile.timeline, preview_duration)
         self._on_profile_changed(self._current_profile.copy(), self.read_variation_count(), self.read_enhance_sharpness())
         self._refresh_inspector()
 
-    def _focus_layer(self, layer: LayerKey) -> None:
+    def _focus_layer(self, layer: LayerKey, *, refresh: bool = True) -> None:
         self._focused_layer = layer
         self.preview.set_active_layer(layer)
         for section_layer, section in self.layer_sections.items():
@@ -733,9 +1133,80 @@ class TextEditorTab(ctk.CTkFrame):
                 border_color=border_color if is_active else "#16253c",
                 fg_color="#12233d" if is_active else "#0f1b31",
             )
+        if refresh:
+            self._refresh_inspector()
 
     def _handle_overlay_focus(self, layer: LayerKey) -> None:
+        self._selected_clip_lane = layer
+        self._selected_clip_id = None
         self._focus_layer(layer)
+
+    def _sync_lane_sample_to_timeline(self, layer: LayerKey, sample_text: str) -> None:
+        clips = self._current_profile.timeline.quote_clips_a if layer == "A" else self._current_profile.timeline.quote_clips_b
+        for clip in clips:
+            clip.sample_text = sample_text
+
+    def _selected_music_clip(self) -> MusicClip | None:
+        if self._selected_clip_lane != "Music" or self._selected_clip_id is None:
+            return None
+        for clip in self._current_profile.timeline.music_clips:
+            if clip.clip_id == self._selected_clip_id:
+                return clip
+        return None
+
+    def _handle_preview_time_change(self, seconds: float, duration: float) -> None:
+        previous_duration = self._current_duration
+        self._current_duration = max(0.0, duration)
+        self.timeline.set_playhead(seconds, notify=False)
+        if abs(previous_duration - self._current_duration) > 0.01:
+            self._current_profile = self._current_profile.normalized_for_duration(self._current_duration)
+            self.timeline.load_timeline(self._current_profile.timeline, self._current_duration)
+        if self._selected_video_path is not None:
+            state = self._video_workspace_state.setdefault(str(self._selected_video_path), VideoWorkspaceState())
+            state.playhead_sec = seconds
+        if not self.preview.is_playing():
+            self._refresh_inspector()
+
+    def _handle_timeline_playhead_change(self, seconds: float) -> None:
+        self.preview.set_playhead(seconds)
+        if self._selected_video_path is not None:
+            state = self._video_workspace_state.setdefault(str(self._selected_video_path), VideoWorkspaceState())
+            state.playhead_sec = seconds
+        if not self.preview.is_playing():
+            self._refresh_inspector()
+
+    def _handle_timeline_lane_focus(self, lane: TimelineLane) -> None:
+        self._selected_clip_lane = lane
+        self._selected_clip_id = None
+        if lane in {"A", "B"}:
+            self._focus_layer(lane)
+            return
+        self._refresh_inspector()
+
+    def _handle_timeline_selection_change(self, lane: TimelineLane | None, clip_id: str | None) -> None:
+        self._selected_clip_lane = lane
+        self._selected_clip_id = clip_id
+        if lane in {"A", "B"}:
+            self._focus_layer(lane)
+            return
+        self._refresh_inspector()
+
+    def _handle_timeline_change(self, timeline) -> None:
+        self._current_profile.timeline = timeline.copy()
+        self._current_profile = self._current_profile.normalized_for_duration(self._current_duration or timeline.duration_hint)
+        self.preview.load_profile(self._current_profile)
+        self._emit_profile_change(refresh_timeline=False)
+        self._capture_workspace_state()
+        self._playback_controller.schedule_audio_prewarm()
+
+    def _on_music_volume_changed(self, value: float) -> None:
+        self.music_section.volume_label.configure(text=f"Громкость выбранного клипа: {int(round(value * 100))}%")
+        clip = self._selected_music_clip()
+        if clip is None or self._suspend_callbacks:
+            return
+        clip.volume = float(value)
+        self.timeline.load_timeline(self._current_profile.timeline, self._current_duration)
+        self._emit_profile_change(refresh_timeline=False)
 
     def _on_font_size_changed(self, layer: LayerKey, value: float) -> None:
         section = self.layer_sections[layer]
@@ -805,21 +1276,32 @@ class TextEditorTab(ctk.CTkFrame):
 
     def _handle_overlay_change(self, layer: LayerKey, style: TextStyle) -> None:
         self._set_layer_style(layer, style)
-        self._focus_layer(layer)
+        self._selected_clip_lane = layer
+        self._selected_clip_id = None
+        self._focus_layer(layer, refresh=False)
         self._load_layer_into_section(layer, style)
+        self._sync_lane_sample_to_timeline(layer, style.preview_text)
         self._on_overlay_changed(layer, style)
         self._refresh_inspector()
 
     def load_profile(self, profile: VideoEditProfile) -> None:
-        self._current_profile = profile.copy()
+        preview_duration = self._current_duration or profile.timeline.duration_hint or 12.0
+        self._current_profile = profile.normalized_for_duration(preview_duration)
         self.preview.load_profile(self._current_profile)
         self._load_layer_into_section("A", self._current_profile.layer_a)
         self._load_layer_into_section("B", self._current_profile.layer_b)
-        self._focus_layer(self._focused_layer)
+        self.timeline.set_lane_defaults(
+            lane_a_text=self._current_profile.layer_a.preview_text,
+            lane_b_text=self._current_profile.layer_b.preview_text,
+        )
+        self.timeline.set_media_sources(video_path=self._selected_video_path, music_tracks=self._music_tracks)
+        self.timeline.load_timeline(self._current_profile.timeline, preview_duration)
+        self._focus_layer(self._focused_layer, refresh=False)
         self._refresh_inspector()
 
     def read_video_profile(self) -> VideoEditProfile:
         self._sync_all_sections_to_profile()
+        self._current_profile.timeline = self.timeline.read_timeline()
         return self._current_profile.copy()
 
     def read_variation_count(self) -> int:
@@ -833,8 +1315,13 @@ class TextEditorTab(ctk.CTkFrame):
         style.preview_text = quote
         if quote.strip():
             style.enabled = True
+        self._sync_lane_sample_to_timeline(layer, quote)
         self._load_layer_into_section(layer, style)
-        self._focus_layer(layer)
+        self.timeline.set_lane_defaults(
+            lane_a_text=self._current_profile.layer_a.preview_text,
+            lane_b_text=self._current_profile.layer_b.preview_text,
+        )
+        self._focus_layer(layer, refresh=False)
         self.preview.update_layer(layer, style)
         self._refresh_inspector()
 
@@ -845,19 +1332,63 @@ class TextEditorTab(ctk.CTkFrame):
             self.listbox.insert("end", path.name)
         if not paths:
             self._selected_video_index = 0
+            self._selected_video_path = None
             self.listbox.selection_clear(0, "end")
             self.current_video_label.configure(text="Видео не выбрано")
+            self.drawer_video_label.configure(text="Видео не выбрано")
             self._refresh_original_actions()
+            self._refresh_inspector()
             return
         if selected_path and selected_path in paths:
             self._selected_video_index = paths.index(selected_path)
         else:
             self._selected_video_index = 0
+        self._selected_video_path = paths[self._selected_video_index]
         self.listbox.selection_clear(0, "end")
         self.listbox.selection_set(self._selected_video_index)
         self.listbox.activate(self._selected_video_index)
         self.current_video_label.configure(text=paths[self._selected_video_index].name)
+        self.drawer_video_label.configure(text=paths[self._selected_video_index].name)
         self._refresh_original_actions()
+        self._refresh_inspector()
+
+    def set_music_tracks(self, tracks: list[Path]) -> None:
+        self._music_tracks = list(tracks)
+        self.timeline.set_media_sources(video_path=self._selected_video_path, music_tracks=self._music_tracks)
+        clip_duration = self._current_duration or self.preview.get_duration() or self._current_profile.timeline.duration_hint
+        created_clip = None
+        if (
+            self._selected_video_path is not None
+            and self._music_tracks
+            and not self._current_profile.timeline.music_clips
+            and clip_duration > 0
+        ):
+            self._current_duration = max(self._current_duration, clip_duration)
+            created_clip = self.timeline.create_clip("Music", seconds=self.preview.get_playhead(), notify=False)
+        if created_clip is not None:
+            self._selected_clip_lane = "Music"
+            self._selected_clip_id = created_clip.clip_id
+            self.timeline.select_clip("Music", created_clip.clip_id)
+        else:
+            self.timeline.ensure_music_lane_visible()
+        self._refresh_inspector()
+        self._playback_controller.schedule_audio_prewarm()
+
+    def load_video_context(self, video_path: Path | None, profile: VideoEditProfile) -> None:
+        self._capture_workspace_state()
+        self._selected_video_path = video_path
+        self.preview.load_video(video_path)
+        self.load_profile(profile)
+        self.timeline.set_media_sources(video_path=video_path, music_tracks=self._music_tracks)
+        if video_path is None:
+            self.current_video_label.configure(text="Видео не выбрано")
+            self.drawer_video_label.configure(text="Видео не выбрано")
+        else:
+            self.current_video_label.configure(text=video_path.name)
+            self.drawer_video_label.configure(text=video_path.name)
+        self._restore_workspace_state()
+        self._refresh_inspector()
+        self._playback_controller.schedule_audio_prewarm()
 
     def set_media_summary(
         self,
@@ -885,27 +1416,34 @@ class TextEditorTab(ctk.CTkFrame):
 
     def set_ffmpeg_status(self, status_text: str, available: bool) -> None:
         color = "#22c55e" if available else "#f97316"
-        self.current_video_label.configure(text_color=color if not self._original_paths else "#f8fafc")
-        if not self._original_paths:
-            self.current_video_label.configure(text=status_text)
+        self.ffmpeg_status_label.configure(text=f"FFmpeg: {status_text}", text_color=color)
+        self.current_video_label.configure(text_color="#f8fafc")
+        self.drawer_video_label.configure(text_color="#f8fafc")
 
     def clear_generation_console(self) -> None:
         self.generation_console.clear()
 
     def set_generation_console_expanded(self, expanded: bool) -> None:
+        self._layout_state.console_visible = expanded
+        self._sync_toggle_buttons()
+        self._apply_workspace_layout()
         self.generation_console.set_expanded(expanded)
 
     def set_stop_button_state(self, *, is_running: bool, stop_requested: bool) -> None:
         if is_running:
             self.stop_generation_button.configure(
                 state="disabled" if stop_requested else "normal",
-                text="Останавливаю..." if stop_requested else "Остановить",
+                text="Останавливаю..." if stop_requested else "Стоп",
             )
         else:
-            self.stop_generation_button.configure(state="disabled", text="Остановить")
+            self.stop_generation_button.configure(state="disabled", text="Стоп")
 
     def push_generation_event(self, event: GenerationProgressEvent) -> None:
         if event.stage not in {"Ожидание"}:
+            if not self._layout_state.console_visible:
+                self._layout_state.console_visible = True
+                self._apply_workspace_layout()
+                self._sync_toggle_buttons()
             self.generation_console.set_expanded(True)
         self.generation_console.push_event(event)
         if event.stage in {"Рендер", "Проверка качества", "Экспорт расписания"}:
@@ -936,6 +1474,7 @@ class TextEditorTab(ctk.CTkFrame):
 
         self.listbox.configure(state=state)
         self.enhance_sharpness_switch.configure(state=state)
+        self.music_section.volume_slider.configure(state=state)
 
         for section in self.layer_sections.values():
             for widget in (
@@ -953,16 +1492,65 @@ class TextEditorTab(ctk.CTkFrame):
             section.bg_color_picker.set_enabled(enabled)
 
         self.preview.set_interaction_enabled(enabled)
+        self.timeline.set_interaction_enabled(enabled)
         if enabled:
             self._refresh_original_actions()
 
     def _refresh_inspector(self) -> None:
         a = self._current_profile.layer_a
         b = self._current_profile.layer_b
+        count_a = len(self._current_profile.timeline.quote_clips_a)
+        count_b = len(self._current_profile.timeline.quote_clips_b)
+        music_count = len(self._current_profile.timeline.music_clips)
+        self.layer_sections["A"].clip_status_label.configure(text=f"Клипы: {count_a}")
+        self.layer_sections["B"].clip_status_label.configure(text=f"Клипы: {count_b}")
+        self.music_section.clip_status_label.configure(text=f"Клипы: {music_count}")
+
+        selected_music = self._selected_music_clip()
+        if selected_music is not None:
+            self.music_section.volume_slider.set(selected_music.volume)
+            self.music_section.volume_label.configure(
+                text=f"Громкость выбранного клипа: {int(round(selected_music.volume * 100))}%"
+            )
+            self.music_section.volume_slider.configure(state="normal")
+        else:
+            self.music_section.volume_slider.set(1.0)
+            self.music_section.volume_label.configure(text="Громкость выбранного клипа: 100%")
+            self.music_section.volume_slider.configure(state="disabled")
+        inspector_target: str | None
+        if self._selected_clip_lane == "Music":
+            inspector_target = "Music"
+            context_title = "Музыкальный клип"
+            context_text = "Громкость и поведение выбранного музыкального окна на timeline."
+        elif self._selected_clip_lane in {"A", "B"}:
+            inspector_target = self._selected_clip_lane
+            layer_style = a if inspector_target == "A" else b
+            context_title = f"Цитата {inspector_target}"
+            context_text = (
+                f"Слой {'включён' if layer_style.enabled else 'выключен'} • "
+                f"клипов: {count_a if inspector_target == 'A' else count_b} • "
+                f"текст: {len(layer_style.preview_text.strip())} символов"
+            )
+        elif self._selected_video_path is None:
+            inspector_target = "Help"
+            context_title = "Ничего не выбрано"
+            context_text = "Загрузите вертикальный ролик и выберите дорожку на stage или timeline."
+        else:
+            inspector_target = self._focused_layer
+            layer_style = a if inspector_target == "A" else b
+            context_title = f"Цитата {inspector_target}"
+            context_text = (
+                f"Текущая активная дорожка • клипов: {count_a if inspector_target == 'A' else count_b} • "
+                f"playhead {self.preview._format_time(self.preview.get_playhead())}"
+            )
+
+        self.inspector_context_label.configure(text=context_title)
         self.layer_status.configure(
             text=(
-                f"Слои:\n"
-                f"A: {'вкл' if a.enabled else 'выкл'} | текст: {len(a.preview_text.strip())} симв.\n"
-                f"B: {'вкл' if b.enabled else 'выкл'} | текст: {len(b.preview_text.strip())} симв."
+                f"{context_text}\n\n"
+                f"Цитата A: {'вкл' if a.enabled else 'выкл'} • {count_a} клипов\n"
+                f"Цитата B: {'вкл' if b.enabled else 'выкл'} • {count_b} клипов\n"
+                f"Music: {music_count} клипов • {len(self._music_tracks)} треков в пуле"
             )
         )
+        self._show_inspector_section(inspector_target)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -16,9 +16,17 @@ from video_unicalizator.config import (
     DEFAULT_PRESET,
     TARGET_HEIGHT,
     TARGET_WIDTH,
+    TIMELINE_FADE_SECONDS,
 )
 from video_unicalizator.core.text_overlay import OverlayLayout, TextOverlayRenderer
-from video_unicalizator.state import ColorGradeProfile, GenerationCancelToken, GenerationCancelledError, TextStyle
+from video_unicalizator.state import (
+    ColorGradeProfile,
+    GenerationCancelToken,
+    GenerationCancelledError,
+    RenderedMusicAssignment,
+    RenderedQuoteAssignment,
+    TextStyle,
+)
 from video_unicalizator.utils.ffmpeg_tools import ensure_ffmpeg_environment, parse_ffmpeg_progress_time, probe_media
 
 RenderProgressCallback = Callable[[float, float | None, float | None, float | None], None]
@@ -93,6 +101,12 @@ class VariationProfile:
     recipe_key: str = ""
 
 
+@dataclass(slots=True)
+class QuoteRenderSegment:
+    style: TextStyle
+    assignment: RenderedQuoteAssignment
+
+
 class VideoProcessor:
     """Рендерит вариации роликов локально через ffmpeg."""
 
@@ -150,9 +164,9 @@ class VideoProcessor:
         self,
         source_video: Path,
         output_video: Path,
-        quote_layers: Sequence[tuple[TextStyle, str]],
+        quote_segments: Sequence[QuoteRenderSegment],
+        music_segments: Sequence[RenderedMusicAssignment],
         profile: VariationProfile,
-        music_track: Path | None,
         music_volume: float,
         progress_callback: RenderProgressCallback | None = None,
         enhance_sharpness: bool = False,
@@ -169,12 +183,12 @@ class VideoProcessor:
 
         with tempfile.TemporaryDirectory(prefix="video_unicalizator_") as temp_dir_str:
             temp_dir = Path(temp_dir_str)
-            overlay_path = self._build_overlay_file(temp_dir, quote_layers)
+            quote_inputs = self._build_overlay_inputs(temp_dir, quote_segments)
             command = self._build_command(
                 ffmpeg_path=ffmpeg_path,
                 source_video=source_video,
-                overlay_path=overlay_path,
-                music_track=music_track,
+                quote_inputs=quote_inputs,
+                music_segments=music_segments,
                 music_volume=music_volume,
                 output_video=output_video,
                 profile=profile,
@@ -184,38 +198,35 @@ class VideoProcessor:
             self._run_ffmpeg(command, output_video, profile.output_duration, progress_callback, cancel_token)
         return profile
 
-    def _build_overlay_file(self, temp_dir: Path, quote_layers: Sequence[tuple[TextStyle, str]]) -> Path | None:
-        composed = Image.new("RGBA", (TARGET_WIDTH, TARGET_HEIGHT), (0, 0, 0, 0))
-        has_visible_content = False
-
-        for layer_style, quote in quote_layers:
-            effective_quote = (quote or layer_style.preview_text).strip()
-            if not layer_style.enabled or not effective_quote:
+    def _build_overlay_inputs(
+        self,
+        temp_dir: Path,
+        quote_segments: Sequence[QuoteRenderSegment],
+    ) -> list[tuple[Path, RenderedQuoteAssignment]]:
+        inputs: list[tuple[Path, RenderedQuoteAssignment]] = []
+        for index, segment in enumerate(quote_segments):
+            effective_text = segment.assignment.text.strip()
+            if not segment.style.enabled or not effective_text or segment.assignment.end_sec <= segment.assignment.start_sec:
                 continue
             renderer = TextOverlayRenderer(
                 OverlayLayout(width=TARGET_WIDTH, height=TARGET_HEIGHT),
-                layer_style,
-                effective_quote,
+                replace(segment.style, preview_text=effective_text),
+                effective_text,
             )
             if renderer.bounds.width <= 0 or renderer.bounds.height <= 0:
                 continue
-            composed.alpha_composite(renderer.overlay_image)
-            has_visible_content = True
-
-        if not has_visible_content:
-            return None
-
-        overlay_path = temp_dir / "quote_overlay.png"
-        composed.save(overlay_path)
-        return overlay_path
+            overlay_path = temp_dir / f"quote_overlay_{index:02d}.png"
+            renderer.overlay_image.save(overlay_path)
+            inputs.append((overlay_path, segment.assignment))
+        return inputs
 
     def _build_command(
         self,
         *,
         ffmpeg_path: str,
         source_video: Path,
-        overlay_path: Path | None,
-        music_track: Path | None,
+        quote_inputs: list[tuple[Path, RenderedQuoteAssignment]],
+        music_segments: Sequence[RenderedMusicAssignment],
         music_volume: float,
         output_video: Path,
         profile: VariationProfile,
@@ -232,23 +243,25 @@ class VideoProcessor:
             str(source_video),
         ]
 
-        overlay_input_index: int | None = None
-        music_input_index: int | None = None
-        input_count = 1
+        quote_input_refs: list[tuple[int, RenderedQuoteAssignment]] = []
+        music_input_refs: list[tuple[int, RenderedMusicAssignment]] = []
+        input_index = 1
 
-        if overlay_path is not None:
-            overlay_input_index = input_count
+        for overlay_path, assignment in quote_inputs:
+            quote_input_refs.append((input_index, assignment))
             command.extend(["-loop", "1", "-i", str(overlay_path)])
-            input_count += 1
+            input_index += 1
 
-        if music_track is not None:
-            music_input_index = input_count
-            command.extend(["-stream_loop", "-1", "-i", str(music_track)])
-            input_count += 1
+        for assignment in music_segments:
+            if assignment.track is None or assignment.end_sec <= assignment.start_sec:
+                continue
+            music_input_refs.append((input_index, assignment))
+            command.extend(["-stream_loop", "-1", "-i", str(assignment.track)])
+            input_index += 1
 
         filter_complex, audio_label = self._build_filter_complex(
-            overlay_input_index=overlay_input_index,
-            music_input_index=music_input_index,
+            quote_inputs=quote_input_refs,
+            music_inputs=music_input_refs,
             music_volume=music_volume,
             profile=profile,
             media_info=media_info,
@@ -286,8 +299,8 @@ class VideoProcessor:
     def _build_filter_complex(
         self,
         *,
-        overlay_input_index: int | None,
-        music_input_index: int | None,
+        quote_inputs: list[tuple[int, RenderedQuoteAssignment]],
+        music_inputs: list[tuple[int, RenderedMusicAssignment]],
         music_volume: float,
         profile: VariationProfile,
         media_info,
@@ -334,13 +347,16 @@ class VideoProcessor:
             filters.append("[vbase][tint]overlay=0:0:format=auto[vtinted]")
             video_label = "vtinted"
 
-        if overlay_input_index is not None:
-            filters.append(f"[{overlay_input_index}:v]format=rgba[quote_overlay]")
+        for index, (input_index, assignment) in enumerate(quote_inputs):
+            quote_label = f"qovl{index}"
+            output_label = f"vq{index}"
+            enable_expr = f"between(t\\,{assignment.start_sec:.3f}\\,{assignment.end_sec:.3f})"
+            filters.append(f"[{input_index}:v]format=rgba[{quote_label}]")
             filters.append(
-                f"[{video_label}][quote_overlay]overlay=0:0:format=auto:shortest=1:eof_action=pass,format=yuv420p[vout]"
+                f"[{video_label}][{quote_label}]overlay=0:0:format=auto:enable='{enable_expr}'[{output_label}]"
             )
-        else:
-            filters.append(f"[{video_label}]format=yuv420p[vout]")
+            video_label = output_label
+        filters.append(f"[{video_label}]format=yuv420p[vout]")
 
         audio_label: str | None = None
         if media_info.has_audio:
@@ -352,16 +368,41 @@ class VideoProcessor:
             )
             audio_label = "voice"
 
-        if music_input_index is not None:
-            filters.append(
-                f"[{music_input_index}:a]volume={music_volume:.4f},"
-                f"atrim=duration={profile.output_duration:.4f},"
-                f"aresample=async=1:first_pts=0[music]"
-            )
-            if audio_label is None:
-                filters.append("[music]anull[aout]")
+        music_labels: list[str] = []
+        for index, (input_index, assignment) in enumerate(music_inputs):
+            clip_duration = max(0.0, assignment.end_sec - assignment.start_sec)
+            if clip_duration <= 0.0:
+                continue
+            volume_value = max(0.0, min(2.0, music_volume * assignment.volume))
+            delay_ms = max(0, int(round(assignment.start_sec * 1000)))
+            fade_duration = min(TIMELINE_FADE_SECONDS, max(0.0, clip_duration / 2 - 0.02))
+            music_label = f"music{index}"
+            music_steps = [
+                f"volume={volume_value:.4f}",
+                f"atrim=start=0:duration={clip_duration:.4f}",
+                "asetpts=PTS-STARTPTS",
+            ]
+            if fade_duration > 0.0:
+                music_steps.append(f"afade=t=in:st=0:d={fade_duration:.3f}")
+                music_steps.append(
+                    f"afade=t=out:st={max(0.0, clip_duration - fade_duration):.4f}:d={fade_duration:.3f}"
+                )
+            music_steps.append(f"adelay={delay_ms}|{delay_ms}")
+            music_steps.append("aresample=async=1:first_pts=0")
+            filters.append(f"[{input_index}:a]{','.join(music_steps)}[{music_label}]")
+            music_labels.append(music_label)
+
+        if music_labels:
+            if len(music_labels) == 1:
+                filters.append(f"[{music_labels[0]}]anull[musicbus]")
             else:
-                filters.append("[voice][music]amix=inputs=2:normalize=0:duration=longest[aout]")
+                inputs = "".join(f"[{label}]" for label in music_labels)
+                filters.append(f"{inputs}amix=inputs={len(music_labels)}:normalize=0:duration=longest[musicbus]")
+
+            if audio_label is None:
+                filters.append("[musicbus]anull[aout]")
+            else:
+                filters.append(f"[{audio_label}][musicbus]amix=inputs=2:normalize=0:duration=longest[aout]")
             audio_label = "aout"
 
         return ";".join(filters), audio_label

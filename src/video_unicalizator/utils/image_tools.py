@@ -87,14 +87,20 @@ def resize_to_preview(width: int, height: int, max_width: int, max_height: int) 
     return max(1, math.floor(width * scale)), max(1, math.floor(height * scale))
 
 
-def fit_cover_frame(frame_rgb: np.ndarray, target_width: int = TARGET_WIDTH, target_height: int = TARGET_HEIGHT) -> np.ndarray:
+def fit_cover_frame(
+    frame_rgb: np.ndarray,
+    target_width: int = TARGET_WIDTH,
+    target_height: int = TARGET_HEIGHT,
+    *,
+    interpolation: int = cv2.INTER_LANCZOS4,
+) -> np.ndarray:
     """Приводит кадр к целевому вертикальному формату через cover-scale и center crop."""
 
     source_height, source_width = frame_rgb.shape[:2]
     scale = max(target_width / source_width, target_height / source_height)
     resized_width = max(1, int(round(source_width * scale)))
     resized_height = max(1, int(round(source_height * scale)))
-    resized = cv2.resize(frame_rgb, (resized_width, resized_height), interpolation=cv2.INTER_LANCZOS4)
+    resized = cv2.resize(frame_rgb, (resized_width, resized_height), interpolation=interpolation)
 
     x_offset = max(0, (resized_width - target_width) // 2)
     y_offset = max(0, (resized_height - target_height) // 2)

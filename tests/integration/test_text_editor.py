@@ -118,6 +118,23 @@ class TextEditorIntegrationTestCase(unittest.TestCase):
         self.assertEqual(tab.layer_sections["A"].sample_quote_box.get("1.0", "end-1c"), quote)
         self.assertEqual(tab.read_video_profile().layer_a.preview_text, quote)
 
+    def test_loading_music_tracks_creates_clip_at_current_playhead_for_selected_video(self) -> None:
+        app, tab = self._create_tab()
+        self.addCleanup(app.destroy)
+
+        tab._selected_video_path = Path("video.mp4")
+        tab._current_duration = 9.0
+        tab.preview._playhead_sec = 1.75
+        tab.load_profile(VideoEditProfile().normalized_for_duration(9.0))
+
+        tab.set_music_tracks([Path("track_a.mp3"), Path("track_b.mp3")])
+        profile = tab.read_video_profile()
+
+        self.assertEqual(len(profile.timeline.music_clips), 1)
+        self.assertAlmostEqual(profile.timeline.music_clips[0].start_sec, 1.75, places=2)
+        self.assertEqual(tab._selected_clip_lane, "Music")
+        self.assertEqual(tab._selected_clip_id, profile.timeline.music_clips[0].clip_id)
+
 
 if __name__ == "__main__":
     unittest.main()

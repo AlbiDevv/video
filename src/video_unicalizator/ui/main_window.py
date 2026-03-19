@@ -58,7 +58,8 @@ class VideoUnicalizatorApp(ctk.CTk):
 
         self.title("Video Unicalizator")
         self.geometry("1540x980")
-        self.minsize(1320, 820)
+        self.minsize(1080, 700)
+        self.resizable(True, True)
         self.configure(fg_color="#050914")
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -156,7 +157,8 @@ class VideoUnicalizatorApp(ctk.CTk):
         self.editor_view.load_profile(self._current_profile())
         self._refresh_media_views()
         self.editor_view.set_output_directory(self.app_state.output_dir)
-        self.editor_view.preview.load_video(self.app_state.selected_video)
+        self.editor_view.set_music_tracks(self.app_state.media.music_tracks)
+        self.editor_view.load_video_context(self.app_state.selected_video, self._current_profile())
 
     def _show_error(self, text: str) -> None:
         self.logger.error(text)
@@ -170,12 +172,15 @@ class VideoUnicalizatorApp(ctk.CTk):
             quotes_count_b=len(self.app_state.media.quotes_b),
             max_warning_variations=self.app_state.generation.max_warning_variations,
         )
+        self.editor_view.set_music_tracks(self.app_state.media.music_tracks)
         self.editor_view.set_originals(self.app_state.media.original_videos, self.app_state.selected_video)
         if self.app_state.selected_video is not None:
-            self.editor_view.load_profile(self.app_state.ensure_video_profile(self.app_state.selected_video))
+            self.editor_view.load_video_context(
+                self.app_state.selected_video,
+                self.app_state.ensure_video_profile(self.app_state.selected_video),
+            )
         else:
-            self.editor_view.load_profile(self._current_profile())
-            self.editor_view.preview.load_video(None)
+            self.editor_view.load_video_context(None, self._current_profile())
 
     def _log_note(self, message: str) -> None:
         self.batch_view.push_log(message)
@@ -207,6 +212,9 @@ class VideoUnicalizatorApp(ctk.CTk):
             layer_style = profile.layer_a if layer == "A" else profile.layer_b
             layer_style.preview_text = quote
             layer_style.enabled = True
+            lane_clips = profile.timeline.quote_clips_a if layer == "A" else profile.timeline.quote_clips_b
+            for clip in lane_clips:
+                clip.sample_text = quote
 
     def _set_originals(self, originals: list[Path], selected_video: Path | None = None) -> None:
         self.app_state.media = merge_media_library(self.app_state.media, originals=originals)
@@ -217,11 +225,12 @@ class VideoUnicalizatorApp(ctk.CTk):
             self.app_state.selected_video = originals[0] if originals else None
         self._refresh_media_views()
         if self.app_state.selected_video:
-            self.editor_view.preview.load_video(self.app_state.selected_video)
-            self.editor_view.load_profile(self.app_state.ensure_video_profile(self.app_state.selected_video))
+            self.editor_view.load_video_context(
+                self.app_state.selected_video,
+                self.app_state.ensure_video_profile(self.app_state.selected_video),
+            )
         else:
-            self.editor_view.preview.load_video(None)
-            self.editor_view.load_profile(self._current_profile())
+            self.editor_view.load_video_context(None, self._current_profile())
         self._log_note(f"Загружено оригиналов: {len(originals)}")
 
     def _set_music(self, music: list[Path]) -> None:
@@ -344,8 +353,7 @@ class VideoUnicalizatorApp(ctk.CTk):
     def _select_video(self, path: Path) -> None:
         self._sync_selected_profile_from_editor()
         self.app_state.selected_video = path
-        self.editor_view.preview.load_video(path)
-        self.editor_view.load_profile(self.app_state.ensure_video_profile(path))
+        self.editor_view.load_video_context(path, self.app_state.ensure_video_profile(path))
 
     def _remove_selected_original(self) -> None:
         if self._worker_thread and self._worker_thread.is_alive():
@@ -359,11 +367,9 @@ class VideoUnicalizatorApp(ctk.CTk):
         self._refresh_media_views()
 
         if new_selected is not None:
-            self.editor_view.preview.load_video(new_selected)
-            self.editor_view.load_profile(self.app_state.ensure_video_profile(new_selected))
+            self.editor_view.load_video_context(new_selected, self.app_state.ensure_video_profile(new_selected))
         else:
-            self.editor_view.preview.load_video(None)
-            self.editor_view.load_profile(self._current_profile())
+            self.editor_view.load_video_context(None, self._current_profile())
         self._log_note(f"Исходник удалён из проекта: {removed_video.name}")
 
     def _handle_profile_change(self, profile: VideoEditProfile, variation_count: int, enhance_sharpness: bool) -> None:
