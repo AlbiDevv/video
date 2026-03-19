@@ -54,6 +54,7 @@ class RenderAttempt:
     secondary_quote: str
     music_track: Path | None
     snapshot: QualityReference | None
+    music_master_volume: float = 1.0
     quote_assignments: list[RenderedQuoteAssignment] = field(default_factory=list)
     music_assignments: list[RenderedMusicAssignment] = field(default_factory=list)
     soft_accepted: bool = False
@@ -335,6 +336,32 @@ class VariationGenerator:
             )
         return assignments
 
+    def _music_render_message(
+        self,
+        *,
+        timeline_clips: list[MusicClip],
+        music_segments: list[RenderedMusicAssignment],
+        music_tracks: list[Path],
+        music_volume: float,
+    ) -> str:
+        active_clips = [clip for clip in timeline_clips if clip.enabled]
+        if not timeline_clips:
+            return "Музыка: на таймлайне нет music clips."
+        if not active_clips:
+            return "Музыка: все music clips выключены."
+        if not music_tracks:
+            return "Музыка: треки не загружены, music assignments пустые."
+        if not music_segments:
+            return (
+                "Музыка: активные клипы есть, но после trim/speed не осталось "
+                "валидных music assignments."
+            )
+        first_track = music_segments[0].track.name if music_segments[0].track is not None else "без_трека"
+        return (
+            f"Музыка: активных клипов {len(active_clips)}, assignments {len(music_segments)}, "
+            f"master volume {music_volume:.2f}, первый трек {first_track}."
+        )
+
     def _warning_reason_codes(self, warnings: list[str]) -> list[str]:
         codes: list[str] = []
         for warning in warnings:
@@ -442,6 +469,18 @@ class VariationGenerator:
                 source_duration=source_duration,
                 music_tracks=state.media.music_tracks,
                 preferred_track=music_choice.track,
+            )
+            self._notify(
+                callback,
+                "Подготовка звука",
+                self._music_render_message(
+                    timeline_clips=normalized_profile.timeline.music_clips,
+                    music_segments=music_segments,
+                    music_tracks=state.media.music_tracks,
+                    music_volume=state.generation.music_volume,
+                ),
+                progress_start,
+                current_file=source_video.name,
             )
             primary_quote = next(
                 (segment.assignment.text for segment in quote_segments if segment.assignment.lane == "A"),
@@ -558,6 +597,7 @@ class VariationGenerator:
                     primary_quote=primary_quote,
                     secondary_quote=secondary_quote,
                     music_track=music_segments[0].track if music_segments else None,
+                    music_master_volume=state.generation.music_volume,
                     snapshot=None,
                     quote_assignments=[replace(segment.assignment) for segment in quote_segments],
                     music_assignments=[replace(segment) for segment in music_segments],
@@ -597,6 +637,7 @@ class VariationGenerator:
                     primary_quote=primary_quote,
                     secondary_quote=secondary_quote,
                     music_track=music_segments[0].track if music_segments else None,
+                    music_master_volume=state.generation.music_volume,
                     snapshot=snapshot,
                     quote_assignments=[replace(segment.assignment) for segment in quote_segments],
                     music_assignments=[replace(segment) for segment in music_segments],
@@ -834,6 +875,7 @@ class VariationGenerator:
                         primary_quote=attempt.primary_quote,
                         secondary_quote=attempt.secondary_quote,
                         music_cycle_index=attempt.profile.music_cycle_index,
+                        music_master_volume=attempt.music_master_volume,
                         filter_preset=attempt.profile.filter_preset,
                         trim_start=attempt.profile.trim_start,
                         trim_end=attempt.profile.trim_end,

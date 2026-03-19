@@ -537,6 +537,7 @@ class GeneratedVariation:
     primary_quote: str = ""
     secondary_quote: str = ""
     music_cycle_index: int = 0
+    music_master_volume: float = MUSIC_VOLUME
     filter_preset: str = "neutral_contrast"
     trim_start: float = 0.0
     trim_end: float = 0.0

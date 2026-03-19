@@ -126,6 +126,7 @@ class VideoUnicalizatorApp(ctk.CTk):
             on_video_selected=self._select_video,
             on_profile_changed=self._handle_profile_change,
             on_overlay_changed=self._handle_overlay_change,
+            on_music_master_volume_changed=self._handle_music_master_volume_change,
         )
 
         self.batch_view = BatchRunnerTab(self.content)
@@ -155,6 +156,7 @@ class VideoUnicalizatorApp(ctk.CTk):
 
     def _sync_ui_with_state(self) -> None:
         self.editor_view.load_profile(self._current_profile())
+        self.editor_view.set_music_master_volume(self.app_state.generation.music_volume)
         self._refresh_media_views()
         self.editor_view.set_output_directory(self.app_state.output_dir)
         self.editor_view.set_music_tracks(self.app_state.media.music_tracks)
@@ -172,6 +174,7 @@ class VideoUnicalizatorApp(ctk.CTk):
             quotes_count_b=len(self.app_state.media.quotes_b),
             max_warning_variations=self.app_state.generation.max_warning_variations,
         )
+        self.editor_view.set_music_master_volume(self.app_state.generation.music_volume)
         self.editor_view.set_music_tracks(self.app_state.media.music_tracks)
         self.editor_view.set_originals(self.app_state.media.original_videos, self.app_state.selected_video)
         if self.app_state.selected_video is not None:
@@ -192,12 +195,16 @@ class VideoUnicalizatorApp(ctk.CTk):
 
     def _sync_selected_profile_from_editor(self) -> None:
         profile = self.editor_view.read_video_profile()
+        self.app_state.generation.music_volume = self.editor_view.read_music_master_volume()
         self.app_state.set_default_layer_sample("A", profile.layer_a.preview_text)
         self.app_state.set_default_layer_sample("B", profile.layer_b.preview_text)
         if self.app_state.selected_video is None:
             return
         self.app_state.video_profiles[str(self.app_state.selected_video)] = profile
         self.app_state.text_style = replace(profile.layer_a)
+
+    def _handle_music_master_volume_change(self, volume: float) -> None:
+        self.app_state.generation.music_volume = float(volume)
 
     def _ensure_profiles_for_originals(self, originals: list[Path]) -> None:
         current = {str(path): self.app_state.ensure_video_profile(path) for path in originals}
@@ -410,6 +417,7 @@ class VideoUnicalizatorApp(ctk.CTk):
             self._sync_selected_profile_from_editor()
             self.app_state.generation.variation_count = validate_variation_count(self.editor_view.read_variation_count())
             self.app_state.generation.enhance_sharpness = self.editor_view.read_enhance_sharpness()
+            self.app_state.generation.music_volume = self.editor_view.read_music_master_volume()
         except ValidationError as error:
             self._show_error(str(error))
             return

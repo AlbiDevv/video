@@ -19,7 +19,7 @@ import customtkinter as ctk
 
 
 class TextEditorIntegrationTestCase(unittest.TestCase):
-    def _create_tab(self) -> tuple[ctk.CTk, TextEditorTab]:
+    def _create_tab(self, **tab_kwargs) -> tuple[ctk.CTk, TextEditorTab]:
         app = ctk.CTk()
         app.geometry("1600x980")
         tab = TextEditorTab(
@@ -39,6 +39,7 @@ class TextEditorIntegrationTestCase(unittest.TestCase):
             on_video_selected=lambda _path: None,
             on_profile_changed=lambda _profile, _variation_count, _enhance: None,
             on_overlay_changed=lambda _layer, _style: None,
+            **tab_kwargs,
         )
         tab.pack(fill="both", expand=True)
         app.update_idletasks()
@@ -135,6 +136,17 @@ class TextEditorIntegrationTestCase(unittest.TestCase):
         self.assertAlmostEqual(profile.timeline.music_clips[0].start_sec, 1.75, places=2)
         self.assertEqual(tab._selected_clip_lane, "Music")
         self.assertEqual(tab._selected_clip_id, profile.timeline.music_clips[0].clip_id)
+
+    def test_music_preview_volume_callback_updates_master_volume(self) -> None:
+        callback_values: list[float] = []
+        app, tab = self._create_tab(on_music_master_volume_changed=lambda value: callback_values.append(value))
+        self.addCleanup(app.destroy)
+
+        tab.preview.set_music_preview_settings(volume=0.68, notify=True)
+
+        self.assertAlmostEqual(tab.read_music_master_volume(), 0.68, places=2)
+        self.assertTrue(callback_values)
+        self.assertAlmostEqual(callback_values[-1], 0.68, places=2)
 
     def test_workspace_state_clears_legacy_selected_time_range(self) -> None:
         app, tab = self._create_tab()

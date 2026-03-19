@@ -34,7 +34,15 @@ TimeChangeCallback = Callable[[float, float], None]
 class VideoPreviewWidget(ctk.CTkFrame):
     """Превью выбранного ролика с редактируемыми дорожками цитат."""
 
-    def __init__(self, master, on_overlay_change, on_overlay_focus=None, on_time_change=None, **kwargs) -> None:
+    def __init__(
+        self,
+        master,
+        on_overlay_change,
+        on_overlay_focus=None,
+        on_time_change=None,
+        on_music_settings_change=None,
+        **kwargs,
+    ) -> None:
         super().__init__(
             master,
             fg_color="#0d1729",
@@ -48,6 +56,7 @@ class VideoPreviewWidget(ctk.CTkFrame):
         self._on_overlay_change = on_overlay_change
         self._on_overlay_focus = on_overlay_focus or (lambda _layer: None)
         self._on_time_change = on_time_change or (lambda _time, _duration: None)
+        self._on_music_settings_change = on_music_settings_change or (lambda _enabled, _volume: None)
         self.logger = logging.getLogger(self.__class__.__name__)
 
         toolbar = ctk.CTkFrame(self, fg_color="transparent")
@@ -205,6 +214,7 @@ class VideoPreviewWidget(ctk.CTkFrame):
         self._pan_y = 0.0
         self._viewport = (0, 0, 1, 1)
         self._interaction_enabled = True
+        self._suspend_audio_setting_callbacks = False
 
         self._playhead_sec = 0.0
         self._active_layer: LayerKey = "A"
@@ -607,6 +617,10 @@ class VideoPreviewWidget(ctk.CTkFrame):
         self._change_zoom(factor)
 
     def _handle_audio_setting_change(self) -> None:
+        if self._suspend_audio_setting_callbacks:
+            return
+        enabled, volume = self.read_music_preview_settings()
+        self._on_music_settings_change(enabled, volume)
         if self._playback_controller is not None and self._is_playing:
             self._playback_controller.restart()
         elif self._playback_controller is not None:
@@ -643,6 +657,28 @@ class VideoPreviewWidget(ctk.CTkFrame):
 
     def read_music_preview_settings(self) -> tuple[bool, float]:
         return bool(self.music_preview_switch.get()), float(self.music_preview_slider.get())
+
+    def set_music_preview_settings(
+        self,
+        *,
+        enabled: bool | None = None,
+        volume: float | None = None,
+        notify: bool = False,
+    ) -> None:
+        self._suspend_audio_setting_callbacks = True
+        try:
+            if enabled is not None:
+                if enabled:
+                    self.music_preview_switch.select()
+                else:
+                    self.music_preview_switch.deselect()
+            if volume is not None:
+                clamped = max(0.0, min(1.5, float(volume)))
+                self.music_preview_slider.set(clamped)
+        finally:
+            self._suspend_audio_setting_callbacks = False
+        if notify:
+            self._handle_audio_setting_change()
 
     def _start_local_playback(self) -> None:
         if self._capture is None:

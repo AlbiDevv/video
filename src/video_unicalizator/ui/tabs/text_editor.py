@@ -111,6 +111,7 @@ class TextEditorTab(ctk.CTkFrame):
         on_video_selected,
         on_profile_changed,
         on_overlay_changed,
+        on_music_master_volume_changed=None,
         on_stop_generation=None,
         on_remove_original=None,
         **kwargs,
@@ -124,6 +125,7 @@ class TextEditorTab(ctk.CTkFrame):
         self._on_video_selected = on_video_selected
         self._on_profile_changed = on_profile_changed
         self._on_overlay_changed = on_overlay_changed
+        self._on_music_master_volume_changed = on_music_master_volume_changed or (lambda _value: None)
         self._suspend_callbacks = False
         self._focused_layer: LayerKey = "A"
         self._current_profile = VideoEditProfile()
@@ -284,6 +286,7 @@ class TextEditorTab(ctk.CTkFrame):
             on_overlay_change=self._handle_overlay_change,
             on_overlay_focus=self._handle_overlay_focus,
             on_time_change=self._handle_preview_time_change,
+            on_music_settings_change=self._handle_music_preview_settings_change,
         )
 
         self.timeline = TimelineEditorWidget(
@@ -1631,6 +1634,18 @@ class TextEditorTab(ctk.CTkFrame):
 
     def read_enhance_sharpness(self) -> bool:
         return bool(self.enhance_sharpness_switch.get())
+
+    def read_music_master_volume(self) -> float:
+        _enabled, volume = self.preview.read_music_preview_settings()
+        return volume
+
+    def set_music_master_volume(self, volume: float) -> None:
+        self.preview.set_music_preview_settings(volume=volume, notify=False)
+
+    def _handle_music_preview_settings_change(self, _enabled: bool, volume: float) -> None:
+        if self._suspend_callbacks:
+            return
+        self._on_music_master_volume_changed(float(volume))
 
     def set_quote_sample(self, layer: LayerKey, quote: str) -> None:
         style = self._get_layer_style(layer)
