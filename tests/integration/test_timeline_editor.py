@@ -96,6 +96,47 @@ class TimelineEditorIntegrationTestCase(unittest.TestCase):
         self.assertIsNotNone(widget._selected_clip_id)
         self.assertTrue(snapshots)
 
+    def test_split_music_clip_preserves_bound_track_and_advances_offset(self) -> None:
+        app = ctk.CTk()
+        self.addCleanup(app.destroy)
+        app.geometry("1500x900")
+
+        widget = TimelineEditorWidget(
+            app,
+            on_timeline_change=lambda _timeline: None,
+            on_playhead_change=lambda _seconds: None,
+            on_lane_focus=lambda _lane: None,
+        )
+        widget.pack(fill="both", expand=True)
+        app.update_idletasks()
+        app.update()
+
+        timeline = VideoTimelineProfile(
+            music_clips=[
+                MusicClip(
+                    clip_id="music_clip",
+                    start_sec=2.0,
+                    end_sec=8.0,
+                    volume=0.8,
+                    bound_track=Path("track.mp3"),
+                    track_offset_sec=3.5,
+                )
+            ],
+            duration_hint=10.0,
+        )
+        widget.load_timeline(timeline, duration=10.0)
+        widget.set_playhead(5.0, notify=False)
+        widget.select_clip("Music", "music_clip")
+        app.update_idletasks()
+        app.update()
+
+        self.assertTrue(widget.split_selected_clip())
+
+        current = widget.read_timeline().music_clips
+        self.assertEqual([(clip.start_sec, clip.end_sec) for clip in current], [(2.0, 5.0), (5.0, 8.0)])
+        self.assertEqual([clip.bound_track for clip in current], [Path("track.mp3"), Path("track.mp3")])
+        self.assertEqual([round(clip.track_offset_sec, 2) for clip in current], [3.5, 6.5])
+
     def test_split_button_enabled_only_when_playhead_inside_selected_clip(self) -> None:
         app = ctk.CTk()
         self.addCleanup(app.destroy)

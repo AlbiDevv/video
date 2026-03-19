@@ -19,7 +19,7 @@ from video_unicalizator.config import (
     PREVIEW_PROXY_MAX_WIDTH,
     TIMELINE_FADE_SECONDS,
 )
-from video_unicalizator.state import MusicClip, VideoTimelineProfile
+from video_unicalizator.state import MusicClip, VideoTimelineProfile, resolve_music_track_bindings
 from video_unicalizator.utils.ffmpeg_tools import (
     ensure_ffmpeg_environment,
     no_window_creationflags,
@@ -37,6 +37,7 @@ class PreviewMusicAssignment:
     end_sec: float
     volume: float
     track: Path | None
+    track_offset_sec: float = 0.0
     cycle_index: int = 0
 
 
@@ -46,29 +47,18 @@ def assign_preview_music_clips(clips: list[MusicClip], tracks: list[Path]) -> li
     if not enabled:
         return assignments
 
-    if not tracks:
-        return [
-            PreviewMusicAssignment(
-                clip_id=clip.clip_id,
-                start_sec=clip.start_sec,
-                end_sec=clip.end_sec,
-                volume=clip.volume,
-                track=None,
-                cycle_index=0,
-            )
-            for clip in enabled
-        ]
-
-    total_tracks = len(tracks)
-    for index, clip in enumerate(enabled):
+    bindings = resolve_music_track_bindings(enabled, tracks)
+    for clip in enabled:
+        track, cycle_index = bindings.get(clip.clip_id, (clip.bound_track, 0))
         assignments.append(
             PreviewMusicAssignment(
                 clip_id=clip.clip_id,
                 start_sec=clip.start_sec,
                 end_sec=clip.end_sec,
                 volume=clip.volume,
-                track=tracks[index % total_tracks],
-                cycle_index=index // total_tracks,
+                track=track,
+                track_offset_sec=max(0.0, float(clip.track_offset_sec)),
+                cycle_index=cycle_index,
             )
         )
     return assignments
@@ -587,7 +577,7 @@ class PreviewAudioCache:
             fade_duration = min(TIMELINE_FADE_SECONDS, max(0.0, duration / 2.0))
             music_label = f"music{index}"
             steps = [
-                f"atrim=start=0:end={duration:.3f}",
+                f"atrim=start={max(0.0, assignment.track_offset_sec):.3f}:duration={duration:.3f}",
                 "asetpts=PTS-STARTPTS",
                 f"volume={max(0.0, min(2.0, music_preview_volume * assignment.volume)):.3f}",
             ]
@@ -669,6 +659,7 @@ class PreviewAudioCache:
                     "start": round(item.start_sec, 3),
                     "end": round(item.end_sec, 3),
                     "volume": round(item.volume, 3),
+                    "track_offset": round(item.track_offset_sec, 3),
                     "track": str(item.track.resolve()) if item.track is not None else None,
                     "track_mtime": item.track.stat().st_mtime_ns if item.track is not None and item.track.exists() else 0,
                 }

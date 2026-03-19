@@ -244,16 +244,61 @@ class VariationGeneratorTestCase(unittest.TestCase):
             target_duration=8.0,
         )
 
-        assignments = generator._build_music_segments(
-            timeline_clips=clips,
-            variation_profile=variation_profile,
-            source_duration=8.0,
-            music_tracks=[Path("a.mp3"), Path("b.mp3"), Path("c.mp3")],
-            preferred_track=Path("b.mp3"),
-        )
+        with patch("pathlib.Path.exists", return_value=True):
+            assignments = generator._build_music_segments(
+                timeline_clips=clips,
+                variation_profile=variation_profile,
+                source_duration=8.0,
+                music_tracks=[Path("a.mp3"), Path("b.mp3"), Path("c.mp3")],
+                preferred_track=Path("b.mp3"),
+            )
 
         self.assertEqual(assignments[0].track, Path("b.mp3"))
         self.assertNotEqual(assignments[0].track, assignments[1].track)
+
+    def test_build_music_segments_uses_bound_track_and_offset_for_split_clip(self) -> None:
+        generator = VariationGenerator()
+        clips = [
+            MusicClip(
+                clip_id="music_a",
+                start_sec=0.0,
+                end_sec=2.0,
+                volume=1.0,
+                bound_track=Path("bound.mp3"),
+                track_offset_sec=6.5,
+            ),
+            MusicClip(
+                clip_id="music_b",
+                start_sec=4.0,
+                end_sec=6.0,
+                volume=1.0,
+                bound_track=Path("bound.mp3"),
+                track_offset_sec=8.5,
+            ),
+        ]
+        variation_profile = VariationProfile(
+            speed_factor=1.0,
+            brightness_shift=0.0,
+            contrast_shift=0.0,
+            saturation_shift=0.0,
+            filter_preset="neutral_contrast",
+            trim_start=0.0,
+            trim_end=0.0,
+            output_duration=8.0,
+            target_duration=8.0,
+        )
+
+        with patch("pathlib.Path.exists", return_value=True):
+            assignments = generator._build_music_segments(
+                timeline_clips=clips,
+                variation_profile=variation_profile,
+                source_duration=8.0,
+                music_tracks=[Path("other.mp3"), Path("bound.mp3")],
+                preferred_track=Path("other.mp3"),
+            )
+
+        self.assertEqual([assignment.track for assignment in assignments], [Path("bound.mp3"), Path("bound.mp3")])
+        self.assertEqual([round(assignment.track_offset_sec, 2) for assignment in assignments], [6.5, 8.5])
 
 
 if __name__ == "__main__":

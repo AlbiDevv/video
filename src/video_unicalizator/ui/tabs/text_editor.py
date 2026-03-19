@@ -1692,6 +1692,9 @@ class TextEditorTab(ctk.CTkFrame):
     def set_music_tracks(self, tracks: list[Path]) -> None:
         self._music_tracks = list(tracks)
         self.timeline.set_media_sources(video_path=self._selected_video_path, music_tracks=self._music_tracks)
+        if self.timeline.bind_unassigned_music_tracks(notify=False):
+            self._current_profile.timeline = self.timeline.read_timeline()
+            self.preview.load_profile(self._current_profile)
         clip_duration = self._current_duration or self.preview.get_duration() or self._current_profile.timeline.duration_hint
         created_clip = None
         if (
@@ -1717,6 +1720,9 @@ class TextEditorTab(ctk.CTkFrame):
         self.preview.load_video(video_path)
         self.load_profile(profile)
         self.timeline.set_media_sources(video_path=video_path, music_tracks=self._music_tracks)
+        if self.timeline.bind_unassigned_music_tracks(notify=False):
+            self._current_profile.timeline = self.timeline.read_timeline()
+            self.preview.load_profile(self._current_profile)
         if video_path is None:
             self.current_video_label.configure(text="Видео не выбрано")
             self.drawer_video_label.configure(text="Видео не выбрано")
@@ -1862,7 +1868,14 @@ class TextEditorTab(ctk.CTkFrame):
         if self._selected_clip_lane == "Music":
             inspector_target = "Music"
             context_title = "Музыкальный клип"
-            context_text = "Громкость и поведение выбранного музыкального окна на timeline."
+            if selected_music is None:
+                context_text = "Громкость и поведение выбранного музыкального окна на timeline."
+            else:
+                track_name = selected_music.bound_track.name if selected_music.bound_track is not None else "не привязан"
+                context_text = (
+                    f"Трек: {track_name} • offset {selected_music.track_offset_sec:.1f}s • "
+                    f"громкость {int(round(selected_music.volume * 100))}%"
+                )
         elif self._selected_clip_lane in {"A", "B"}:
             inspector_target = self._selected_clip_lane
             layer_style = a if inspector_target == "A" else b

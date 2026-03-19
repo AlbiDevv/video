@@ -18,7 +18,14 @@ from video_unicalizator.config import (
     TIMELINE_SNAP_SECONDS,
     TIMELINE_ZOOM_STEP,
 )
-from video_unicalizator.state import MusicClip, QuoteClip, TimelineClip, TimelineLane, VideoTimelineProfile
+from video_unicalizator.state import (
+    MusicClip,
+    QuoteClip,
+    TimelineClip,
+    TimelineLane,
+    VideoTimelineProfile,
+    bind_unassigned_music_clips,
+)
 from video_unicalizator.ui.preview_support import ThumbnailStripCache, WaveformCache, assign_preview_music_clips
 
 TimelineChangeCallback = Callable[[VideoTimelineProfile], None]
@@ -271,6 +278,20 @@ class TimelineEditorWidget(ctk.CTkFrame):
         self._video_path = video_path
         self._music_tracks = list(music_tracks)
         self._redraw()
+
+    def bind_unassigned_music_tracks(self, *, notify: bool = False) -> bool:
+        if not self._timeline.music_clips or not self._music_tracks:
+            return False
+        updated = bind_unassigned_music_clips(self._timeline.music_clips, self._music_tracks)
+        changed = any(old.bound_track != new.bound_track for old, new in zip(self._timeline.music_clips, updated))
+        if not changed:
+            return False
+        self._timeline.music_clips = self._normalize_lane_clips("Music", updated)  # type: ignore[assignment]
+        if notify:
+            self._emit_timeline_change()
+        else:
+            self._redraw_tracks_only()
+        return True
 
     def load_timeline(self, timeline: VideoTimelineProfile, duration: float) -> None:
         self._timeline = timeline.copy()
@@ -830,7 +851,7 @@ class TimelineEditorWidget(ctk.CTkFrame):
 
     def _lane_hint(self, lane: TimelineLane) -> str:
         if lane == "Music":
-            return "clip-based pool preview"
+            return "bound track continuity"
         return "pool/sample"
 
     def _clip_title(self, lane: TimelineLane, clip: TimelineClip, music_assignment) -> str:
@@ -844,6 +865,11 @@ class TimelineEditorWidget(ctk.CTkFrame):
         return f"Clip {lane}"
 
     def _clip_meta(self, clip: TimelineClip) -> str:
+        if isinstance(clip, MusicClip):
+            return (
+                f"{clip.start_sec:.1f}s -> {clip.end_sec:.1f}s · {clip.duration_sec:.1f}s · "
+                f"offset {clip.track_offset_sec:.1f}s"
+            )
         return f"{clip.start_sec:.1f}s -> {clip.end_sec:.1f}s · {clip.duration_sec:.1f}s"
 
     def _update_playhead_label(self) -> None:
@@ -931,12 +957,15 @@ class TimelineEditorWidget(ctk.CTkFrame):
                 source_mode=clip.source_mode,
             )
         if isinstance(clip, MusicClip):
+            start_delta = start_sec - clip.start_sec
             return MusicClip(
                 start_sec=start_sec,
                 end_sec=end_sec,
                 enabled=clip.enabled,
                 volume=clip.volume,
                 source_mode=clip.source_mode,
+                bound_track=clip.bound_track,
+                track_offset_sec=max(0.0, round(clip.track_offset_sec + start_delta, 3)),
             )
         return TimelineClip(start_sec=start_sec, end_sec=end_sec, enabled=clip.enabled)
 
@@ -1023,7 +1052,17 @@ class TimelineEditorWidget(ctk.CTkFrame):
             start_sec = max(0.0, self._duration - TIMELINE_DEFAULT_CLIP_SECONDS)
             end_sec = self._duration
         if lane == "Music":
-            new_clip: TimelineClip = MusicClip(start_sec=start_sec, end_sec=end_sec, volume=1.0)
+            new_clip = MusicClip(start_sec=start_sec, end_sec=end_sec, volume=1.0)
+            if self._music_tracks:
+                preview_binding = bind_unassigned_music_clips([*self._timeline.music_clips, new_clip], self._music_tracks)
+                new_clip = next(
+                    (
+                        clip
+                        for clip in preview_binding
+                        if isinstance(clip, MusicClip) and clip.clip_id == new_clip.clip_id
+                    ),
+                    new_clip,
+                )
         else:
             new_clip = QuoteClip(
                 start_sec=start_sec,
@@ -1076,7 +1115,18 @@ class TimelineEditorWidget(ctk.CTkFrame):
             current.start_sec, current.end_sec = start_sec, end_sec
         elif self._drag_mode == "resize_start":
             start_sec = self._snap_time(self._selected_lane, self._selected_clip_id, seconds)
+            if self._selected_lane == "Music":
+                left_bound = 0.0
+                for neighbour in clips:
+                    if neighbour.clip_id == self._selected_clip_id:
+                        continue
+                    if neighbour.end_sec <= self._drag_origin_clip.start_sec:
+                        left_bound = max(left_bound, neighbour.end_sec)
+                start_sec = max(left_bound, min(start_sec, current.end_sec - TIMELINE_MIN_CLIP_SECONDS))
             current.start_sec = max(0.0, min(start_sec, current.end_sec - TIMELINE_MIN_CLIP_SECONDS))
+            if isinstance(current, MusicClip) and isinstance(self._drag_origin_clip, MusicClip):
+                delta_start = current.start_sec - self._drag_origin_clip.start_sec
+                current.track_offset_sec = max(0.0, round(self._drag_origin_clip.track_offset_sec + delta_start, 3))
         elif self._drag_mode == "resize_end":
             end_sec = self._snap_time(self._selected_lane, self._selected_clip_id, seconds)
             current.end_sec = min(self._duration, max(end_sec, current.start_sec + TIMELINE_MIN_CLIP_SECONDS))

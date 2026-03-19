@@ -36,6 +36,7 @@ class VideoProcessorTestCase(unittest.TestCase):
             start_sec=1.0,
             end_sec=3.5,
             volume=0.5,
+            track_offset_sec=4.25,
         )
         command = self.processor._build_command(
             ffmpeg_path="ffmpeg",
@@ -52,6 +53,7 @@ class VideoProcessorTestCase(unittest.TestCase):
         self.assertIn(str(Path("track.mp3")), command)
         filter_complex = command[command.index("-filter_complex") + 1]
         self.assertIn("[1:a]volume=0.6000", filter_complex)
+        self.assertIn("atrim=start=4.2500:duration=2.5000", filter_complex)
         self.assertIn("[music0]anull[musicbus]", filter_complex)
         self.assertIn("[voice][musicbus]amix=inputs=2:normalize=0:duration=longest[aout]", filter_complex)
         self.assertIn("[aout]", command)
@@ -63,6 +65,7 @@ class VideoProcessorTestCase(unittest.TestCase):
             start_sec=0.5,
             end_sec=2.0,
             volume=0.8,
+            track_offset_sec=7.0,
         )
 
         filter_complex, audio_label = self.processor._build_filter_complex(
@@ -76,6 +79,7 @@ class VideoProcessorTestCase(unittest.TestCase):
 
         self.assertEqual(audio_label, "aout")
         self.assertIn("[1:a]volume=0.8000", filter_complex)
+        self.assertIn("atrim=start=7.0000:duration=1.5000", filter_complex)
         self.assertIn("[music0]anull[musicbus]", filter_complex)
         self.assertIn("[musicbus]anull[aout]", filter_complex)
         self.assertNotIn("[0:a]", filter_complex)

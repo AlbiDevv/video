@@ -373,12 +373,13 @@ class VideoProcessor:
             if clip_duration <= 0.0:
                 continue
             volume_value = max(0.0, min(2.0, music_volume * assignment.volume))
+            track_offset_sec = max(0.0, assignment.track_offset_sec)
             delay_ms = max(0, int(round(assignment.start_sec * 1000)))
             fade_duration = min(TIMELINE_FADE_SECONDS, max(0.0, clip_duration / 2 - 0.02))
             music_label = f"music{index}"
             music_steps = [
                 f"volume={volume_value:.4f}",
-                f"atrim=start=0:duration={clip_duration:.4f}",
+                f"atrim=start={track_offset_sec:.4f}:duration={clip_duration:.4f}",
                 "asetpts=PTS-STARTPTS",
             ]
             if fade_duration > 0.0:

@@ -26,6 +26,7 @@ from video_unicalizator.state import (
     RenderedMusicAssignment,
     RenderedQuoteAssignment,
     VideoEditProfile,
+    resolve_music_track_bindings,
 )
 from video_unicalizator.utils.ffmpeg_tools import ffmpeg_available
 from video_unicalizator.utils.validation import ValidationError
@@ -303,7 +304,11 @@ class VariationGenerator:
         preferred_track: Path | None,
     ) -> list[RenderedMusicAssignment]:
         assignments: list[RenderedMusicAssignment] = []
-        used_tracks: set[Path] = set()
+        track_bindings = resolve_music_track_bindings(
+            timeline_clips,
+            music_tracks,
+            preferred_first_track=preferred_track,
+        )
 
         for clip in timeline_clips:
             mapped = self._map_clip_to_output(
@@ -314,24 +319,21 @@ class VariationGenerator:
             )
             if mapped is None or not clip.enabled:
                 continue
-            preferred = preferred_track if not assignments else None
-            choice = self.music_rotation.pick(
-                music_tracks,
-                used_in_roll=used_tracks,
-                preferred_track=preferred,
-            )
-            if choice.track is None:
+            resolved_track, cycle_index = track_bindings.get(clip.clip_id, (clip.bound_track, 0))
+            if resolved_track is not None:
+                resolved_track = Path(resolved_track)
+            if resolved_track is None or not resolved_track.exists():
                 continue
-            used_tracks.add(choice.track)
             assignments.append(
                 RenderedMusicAssignment(
                     clip_id=clip.clip_id,
-                    track=choice.track,
+                    track=resolved_track,
                     start_sec=mapped[0],
                     end_sec=mapped[1],
                     volume=clip.volume,
-                    source_mode="pool",
-                    cycle_index=choice.cycle_index,
+                    track_offset_sec=max(0.0, float(clip.track_offset_sec)),
+                    source_mode=clip.source_mode,
+                    cycle_index=cycle_index,
                 )
             )
         return assignments
@@ -345,13 +347,23 @@ class VariationGenerator:
         music_volume: float,
     ) -> str:
         active_clips = [clip for clip in timeline_clips if clip.enabled]
+        missing_tracks = [
+            clip.bound_track
+            for clip in active_clips
+            if clip.bound_track is not None and not Path(clip.bound_track).exists()
+        ]
         if not timeline_clips:
             return "Музыка: на таймлайне нет music clips."
         if not active_clips:
             return "Музыка: все music clips выключены."
-        if not music_tracks:
-            return "Музыка: треки не загружены, music assignments пустые."
+        if missing_tracks and not music_segments:
+            return (
+                f"Музыка: привязанный трек не найден на диске ({Path(missing_tracks[0]).name}), "
+                "клип станет тишиной."
+            )
         if not music_segments:
+            if not music_tracks and not any(clip.bound_track is not None for clip in active_clips):
+                return "Музыка: треки не загружены, music assignments пустые."
             return (
                 "Музыка: активные клипы есть, но после trim/speed не осталось "
                 "валидных music assignments."
@@ -359,7 +371,8 @@ class VariationGenerator:
         first_track = music_segments[0].track.name if music_segments[0].track is not None else "без_трека"
         return (
             f"Музыка: активных клипов {len(active_clips)}, assignments {len(music_segments)}, "
-            f"master volume {music_volume:.2f}, первый трек {first_track}."
+            f"master volume {music_volume:.2f}, первый трек {first_track}, "
+            f"offset {music_segments[0].track_offset_sec:.2f}s."
         )
 
     def _warning_reason_codes(self, warnings: list[str]) -> list[str]:

@@ -106,6 +106,71 @@ class MusicClip(TimelineClip):
 
     volume: float = 1.0
     source_mode: TimelineSourceMode = "pool"
+    bound_track: Path | None = None
+    track_offset_sec: float = 0.0
+
+
+def normalize_music_track_pool(tracks: list[Path]) -> list[Path]:
+    ordered: list[Path] = []
+    seen: set[str] = set()
+    for track in tracks:
+        normalized = Path(track)
+        key = str(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(normalized)
+    return ordered
+
+
+def resolve_music_track_bindings(
+    clips: list[MusicClip],
+    tracks: list[Path],
+    *,
+    preferred_first_track: Path | None = None,
+) -> dict[str, tuple[Path | None, int]]:
+    pool = normalize_music_track_pool(tracks)
+    bindings: dict[str, tuple[Path | None, int]] = {}
+    used_in_cycle: set[Path] = set()
+    cycle_index = 0
+    preferred_pending = Path(preferred_first_track) if preferred_first_track is not None else None
+
+    for clip in sorted(clips, key=lambda item: (item.start_sec, item.end_sec, item.clip_id)):
+        bound_track = Path(clip.bound_track) if clip.bound_track is not None else None
+        if bound_track is not None:
+            chosen_track = bound_track
+        elif not pool:
+            chosen_track = None
+        else:
+            available = [track for track in pool if track not in used_in_cycle]
+            if not available:
+                used_in_cycle.clear()
+                cycle_index += 1
+                available = list(pool)
+            if preferred_pending is not None and preferred_pending in available:
+                chosen_track = preferred_pending
+                preferred_pending = None
+            else:
+                chosen_track = available[0]
+        bindings[clip.clip_id] = (chosen_track, cycle_index)
+        if chosen_track is not None and chosen_track in pool:
+            used_in_cycle.add(chosen_track)
+    return bindings
+
+
+def bind_unassigned_music_clips(clips: list[MusicClip], tracks: list[Path]) -> list[MusicClip]:
+    bindings = resolve_music_track_bindings(clips, tracks)
+    bound: list[MusicClip] = []
+    for clip in clips:
+        if clip.bound_track is not None:
+            bound.append(replace(clip))
+            continue
+        track, _cycle_index = bindings.get(clip.clip_id, (None, 0))
+        if track is None:
+            bound.append(replace(clip))
+            continue
+        bound.append(replace(clip, bound_track=track))
+    return bound
 
 
 @dataclass(slots=True)
@@ -251,29 +316,58 @@ def cut_timeline_clips_to_range(
         if clip.start_sec >= cut_start and clip.end_sec <= cut_end:
             continue
         if clip.start_sec < cut_start and clip.end_sec > cut_end:
-            left_clip = replace(clip, end_sec=round(cut_start, 3))
-            right_clip = _split_clip_copy(clip, start_sec=round(cut_end, 3), end_sec=round(clip.end_sec, 3))
+            left_clip = _copy_clip_with_range(
+                clip,
+                start_sec=round(clip.start_sec, 3),
+                end_sec=round(cut_start, 3),
+                preserve_clip_id=True,
+            )
+            right_clip = _copy_clip_with_range(
+                clip,
+                start_sec=round(cut_end, 3),
+                end_sec=round(clip.end_sec, 3),
+                preserve_clip_id=False,
+                track_progress_sec=round(max(0.0, cut_start - clip.start_sec), 3),
+            )
             if left_clip.duration_sec >= TIMELINE_MIN_CLIP_SECONDS:
                 result.append(left_clip)
             if right_clip.duration_sec >= TIMELINE_MIN_CLIP_SECONDS:
                 result.append(right_clip)
             continue
         if clip.start_sec < cut_start:
-            trimmed = replace(clip, end_sec=round(cut_start, 3))
+            trimmed = _copy_clip_with_range(
+                clip,
+                start_sec=round(clip.start_sec, 3),
+                end_sec=round(cut_start, 3),
+                preserve_clip_id=True,
+            )
             if trimmed.duration_sec >= TIMELINE_MIN_CLIP_SECONDS:
                 result.append(trimmed)
             continue
-        trimmed = replace(clip, start_sec=round(cut_end, 3))
+        trimmed = _copy_clip_with_range(
+            clip,
+            start_sec=round(cut_end, 3),
+            end_sec=round(clip.end_sec, 3),
+            preserve_clip_id=True,
+            track_progress_sec=round(max(0.0, cut_start - clip.start_sec), 3),
+        )
         if trimmed.duration_sec >= TIMELINE_MIN_CLIP_SECONDS:
             result.append(trimmed)
 
     return result
 
 
-def _split_clip_copy(clip: TimelineClip, *, start_sec: float, end_sec: float) -> TimelineClip:
+def _copy_clip_with_range(
+    clip: TimelineClip,
+    *,
+    start_sec: float,
+    end_sec: float,
+    preserve_clip_id: bool,
+    track_progress_sec: float | None = None,
+) -> TimelineClip:
     if isinstance(clip, QuoteClip):
         return QuoteClip(
-            clip_id=_clip_id(f"quote_{clip.lane.lower()}"),
+            clip_id=clip.clip_id if preserve_clip_id else _clip_id(f"quote_{clip.lane.lower()}"),
             start_sec=start_sec,
             end_sec=end_sec,
             enabled=clip.enabled,
@@ -282,16 +376,19 @@ def _split_clip_copy(clip: TimelineClip, *, start_sec: float, end_sec: float) ->
             source_mode=clip.source_mode,
         )
     if isinstance(clip, MusicClip):
+        start_delta = (start_sec - clip.start_sec) if track_progress_sec is None else track_progress_sec
         return MusicClip(
-            clip_id=_clip_id("music"),
+            clip_id=clip.clip_id if preserve_clip_id else _clip_id("music"),
             start_sec=start_sec,
             end_sec=end_sec,
             enabled=clip.enabled,
             volume=clip.volume,
             source_mode=clip.source_mode,
+            bound_track=clip.bound_track,
+            track_offset_sec=max(0.0, round(clip.track_offset_sec + start_delta, 3)),
         )
     return TimelineClip(
-        clip_id=_clip_id("clip"),
+        clip_id=clip.clip_id if preserve_clip_id else _clip_id("clip"),
         start_sec=start_sec,
         end_sec=end_sec,
         enabled=clip.enabled,
@@ -308,6 +405,8 @@ def _normalize_music_clips(clips: list[MusicClip], *, duration: float) -> list[M
             enabled=clip.enabled,
             volume=max(0.0, min(2.0, clip.volume)),
             source_mode=clip.source_mode,
+            bound_track=clip.bound_track,
+            track_offset_sec=max(0.0, round(clip.track_offset_sec, 3)),
         )
         for clip in normalized
     ]
@@ -517,6 +616,7 @@ class RenderedMusicAssignment:
     start_sec: float
     end_sec: float
     volume: float
+    track_offset_sec: float = 0.0
     source_mode: TimelineSourceMode = "pool"
     cycle_index: int = 0
 
