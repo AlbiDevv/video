@@ -61,6 +61,55 @@ class RecipePlannerTestCase(unittest.TestCase):
         self.assertNotIn("quote", candidate.recipe.recipe_key.lower())
         self.assertNotIn("цит", candidate.recipe.recipe_key.lower())
 
+    def test_bootstrap_and_random_recipes_always_use_neutral_center_crop(self) -> None:
+        music_choice = MusicChoice(track=Path("track_a.mp3"), cycle_index=0)
+
+        bootstrap = self.planner._bootstrap_recipe(music_choice)
+        sampled = self.planner._random_recipe(music_choice)
+
+        self.assertEqual((bootstrap.crop_family, bootstrap.crop_anchor), ("neutral", "center"))
+        self.assertEqual((sampled.crop_family, sampled.crop_anchor), ("neutral", "center"))
+
+    def test_crop_values_do_not_affect_recipe_identity_or_distance(self) -> None:
+        music_choice = MusicChoice(track=Path("track_a.mp3"), cycle_index=0)
+
+        left = self.planner._build_recipe(
+            speed_factor=1.0,
+            trim_start=0.2,
+            trim_end=0.1,
+            duration_key=120,
+            output_duration=12.0,
+            filter_preset="neutral_contrast",
+            brightness_variant=0,
+            contrast_variant=1,
+            saturation_variant=0,
+            accent_strength_variant=0,
+            crop_family="neutral",
+            crop_anchor="center",
+            sharpen_enabled=False,
+            music_choice=music_choice,
+        )
+        right = self.planner._build_recipe(
+            speed_factor=1.0,
+            trim_start=0.2,
+            trim_end=0.1,
+            duration_key=120,
+            output_duration=12.0,
+            filter_preset="neutral_contrast",
+            brightness_variant=0,
+            contrast_variant=1,
+            saturation_variant=0,
+            accent_strength_variant=0,
+            crop_family="tight_crop",
+            crop_anchor="top",
+            sharpen_enabled=False,
+            music_choice=music_choice,
+        )
+
+        self.assertEqual(left.visual_key, right.visual_key)
+        self.assertEqual(left.recipe_key, right.recipe_key)
+        self.assertEqual(self.planner.recipe_distance(left, right), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,14 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from video_unicalizator.state import AppState, MusicClip, QuoteClip, VideoTimelineProfile, cut_timeline_clips_to_range
+from video_unicalizator.state import (
+    AppState,
+    MusicClip,
+    QuoteClip,
+    VideoTimelineProfile,
+    cut_timeline_clips_to_range,
+    resolve_music_track_bindings,
+)
 
 
 class AppStateTestCase(unittest.TestCase):
@@ -175,6 +182,79 @@ class AppStateTestCase(unittest.TestCase):
 
         self.assertEqual([(item.start_sec, item.end_sec) for item in result], [(0.0, 2.0), (5.0, 8.0)])
         self.assertEqual([round(item.track_offset_sec, 2) for item in result], [10.0, 12.0])
+
+    def test_resolve_music_track_bindings_ignores_singleton_legacy_bound_track(self) -> None:
+        clips = [
+            MusicClip(
+                clip_id="music_a",
+                start_sec=0.0,
+                end_sec=2.0,
+                volume=1.0,
+                bound_track=Path("legacy.mp3"),
+            ),
+            MusicClip(clip_id="music_b", start_sec=2.0, end_sec=4.0, volume=1.0),
+        ]
+
+        bindings = resolve_music_track_bindings(
+            clips,
+            [Path("alpha.mp3"), Path("beta.mp3")],
+            preferred_first_track=Path("beta.mp3"),
+        )
+
+        self.assertEqual(bindings["music_a"], (Path("beta.mp3"), 0))
+        self.assertEqual(bindings["music_b"], (Path("alpha.mp3"), 0))
+
+    def test_resolve_music_track_bindings_keeps_continuity_group_rotating_as_one_pick(self) -> None:
+        clips = [
+            MusicClip(
+                clip_id="music_a",
+                start_sec=0.0,
+                end_sec=2.0,
+                volume=1.0,
+                bound_track=Path("legacy.mp3"),
+            ),
+            MusicClip(
+                clip_id="music_b",
+                start_sec=3.0,
+                end_sec=5.0,
+                volume=1.0,
+                bound_track=Path("legacy.mp3"),
+                track_offset_sec=2.0,
+            ),
+            MusicClip(clip_id="music_c", start_sec=5.0, end_sec=7.0, volume=1.0),
+        ]
+
+        bindings = resolve_music_track_bindings(
+            clips,
+            [Path("alpha.mp3"), Path("beta.mp3")],
+            preferred_first_track=Path("beta.mp3"),
+        )
+
+        self.assertEqual(bindings["music_a"], (Path("beta.mp3"), 0))
+        self.assertEqual(bindings["music_b"], (Path("beta.mp3"), 0))
+        self.assertEqual(bindings["music_c"], (Path("alpha.mp3"), 0))
+
+    def test_resolve_music_track_bindings_preserves_locked_track_and_consumes_pool_slot(self) -> None:
+        clips = [
+            MusicClip(
+                clip_id="music_locked",
+                start_sec=0.0,
+                end_sec=2.0,
+                volume=1.0,
+                bound_track=Path("alpha.mp3"),
+                track_locked=True,
+            ),
+            MusicClip(clip_id="music_auto", start_sec=2.0, end_sec=4.0, volume=1.0),
+        ]
+
+        bindings = resolve_music_track_bindings(
+            clips,
+            [Path("alpha.mp3"), Path("beta.mp3")],
+            preferred_first_track=Path("alpha.mp3"),
+        )
+
+        self.assertEqual(bindings["music_locked"], (Path("alpha.mp3"), 0))
+        self.assertEqual(bindings["music_auto"], (Path("beta.mp3"), 0))
 
 
 if __name__ == "__main__":

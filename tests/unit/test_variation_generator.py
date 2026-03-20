@@ -17,7 +17,14 @@ from video_unicalizator.core.variation_generator import (
     VariationGenerator,
 )
 from video_unicalizator.core.video_processor import VariationProfile
-from video_unicalizator.state import AppState, GenerationCancelToken, MusicClip, QuoteClip, VideoEditProfile
+from video_unicalizator.state import (
+    AppState,
+    GenerationCancelToken,
+    MusicClip,
+    QuoteClip,
+    RenderedMusicAssignment,
+    VideoEditProfile,
+)
 
 
 class VariationGeneratorTestCase(unittest.TestCase):
@@ -297,8 +304,125 @@ class VariationGeneratorTestCase(unittest.TestCase):
                 preferred_track=Path("other.mp3"),
             )
 
-        self.assertEqual([assignment.track for assignment in assignments], [Path("bound.mp3"), Path("bound.mp3")])
+        self.assertEqual([assignment.track for assignment in assignments], [Path("other.mp3"), Path("other.mp3")])
         self.assertEqual([round(assignment.track_offset_sec, 2) for assignment in assignments], [6.5, 8.5])
+
+    def test_build_music_segments_preserves_locked_bound_track(self) -> None:
+        generator = VariationGenerator()
+        clips = [
+            MusicClip(
+                clip_id="music_locked",
+                start_sec=0.0,
+                end_sec=2.0,
+                volume=1.0,
+                bound_track=Path("bound.mp3"),
+                track_locked=True,
+                track_offset_sec=2.25,
+            ),
+            MusicClip(
+                clip_id="music_auto",
+                start_sec=2.0,
+                end_sec=4.0,
+                volume=1.0,
+            ),
+        ]
+        variation_profile = VariationProfile(
+            speed_factor=1.0,
+            brightness_shift=0.0,
+            contrast_shift=0.0,
+            saturation_shift=0.0,
+            filter_preset="neutral_contrast",
+            trim_start=0.0,
+            trim_end=0.0,
+            output_duration=8.0,
+            target_duration=8.0,
+        )
+
+        with patch("pathlib.Path.exists", return_value=True):
+            assignments = generator._build_music_segments(
+                timeline_clips=clips,
+                variation_profile=variation_profile,
+                source_duration=8.0,
+                music_tracks=[Path("bound.mp3"), Path("other.mp3")],
+                preferred_track=Path("other.mp3"),
+            )
+
+        self.assertEqual([assignment.track for assignment in assignments], [Path("bound.mp3"), Path("other.mp3")])
+        self.assertEqual([assignment.track_locked for assignment in assignments], [True, False])
+
+    def test_generate_advances_music_rotation_once_per_auto_track_cycle_pair(self) -> None:
+        state = AppState()
+        state.media.original_videos = [Path("source.mp4")]
+        state.media.music_tracks = [Path("a.mp3"), Path("b.mp3")]
+        state.output_dir = Path("outputs")
+        state.generation.variation_count = 1
+        state.generation.render_retry_attempts = 1
+        profile = state.ensure_video_profile(Path("source.mp4")).normalized_for_duration(8.0)
+        profile.timeline.music_clips = [
+            MusicClip(clip_id="m1", start_sec=0.0, end_sec=2.0, volume=1.0),
+            MusicClip(clip_id="m2", start_sec=2.0, end_sec=4.0, volume=1.0),
+        ]
+        state.video_profiles[str(Path("source.mp4"))] = profile
+
+        generator = VariationGenerator()
+        attempt = RenderAttempt(
+            output_video=Path("outputs/source_v1.mp4"),
+            profile=VariationProfile(
+                speed_factor=1.0,
+                brightness_shift=0.0,
+                contrast_shift=0.0,
+                saturation_shift=0.0,
+                filter_preset="neutral_contrast",
+                trim_start=0.0,
+                trim_end=0.0,
+                output_duration=8.0,
+                target_duration=8.0,
+                music_cycle_index=0,
+            ),
+            report=QualityReport(
+                sharpness_score=100.0,
+                visual_difference_score=10.0,
+                format_ok=True,
+                duration_seconds=8.0,
+                duration_unique=True,
+                warnings=[],
+            ),
+            primary_quote="",
+            secondary_quote="",
+            music_track=Path("a.mp3"),
+            snapshot=None,
+            music_assignments=[
+                RenderedMusicAssignment(
+                    clip_id="m1",
+                    track=Path("a.mp3"),
+                    start_sec=0.0,
+                    end_sec=2.0,
+                    volume=1.0,
+                    cycle_index=0,
+                    track_locked=False,
+                ),
+                RenderedMusicAssignment(
+                    clip_id="m2",
+                    track=Path("a.mp3"),
+                    start_sec=2.0,
+                    end_sec=4.0,
+                    volume=1.0,
+                    cycle_index=0,
+                    track_locked=False,
+                ),
+            ],
+        )
+
+        with (
+            patch("video_unicalizator.core.variation_generator.ffmpeg_available", return_value=(True, "")),
+            patch.object(generator.quality_checker, "inspect_video", return_value=(1080, 1920, 8.0)),
+            patch.object(generator, "_resolve_quote_pools", return_value=([], [])),
+            patch.object(generator, "_render_with_quality_gate", return_value=attempt),
+        ):
+            generated = generator.generate(state)
+
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(generator._music_pick_count, 1)
 
 
 if __name__ == "__main__":

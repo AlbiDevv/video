@@ -107,6 +107,7 @@ class MusicClip(TimelineClip):
     volume: float = 1.0
     source_mode: TimelineSourceMode = "pool"
     bound_track: Path | None = None
+    track_locked: bool = False
     track_offset_sec: float = 0.0
 
 
@@ -134,27 +135,57 @@ def resolve_music_track_bindings(
     used_in_cycle: set[Path] = set()
     cycle_index = 0
     preferred_pending = Path(preferred_first_track) if preferred_first_track is not None else None
+    ordered = sorted(clips, key=lambda item: (item.start_sec, item.end_sec, item.clip_id))
+    continuity_counts: dict[str, int] = {}
+    continuity_bindings: dict[str, tuple[Path | None, int]] = {}
 
-    for clip in sorted(clips, key=lambda item: (item.start_sec, item.end_sec, item.clip_id)):
-        bound_track = Path(clip.bound_track) if clip.bound_track is not None else None
-        if bound_track is not None:
-            chosen_track = bound_track
-        elif not pool:
-            chosen_track = None
+    for clip in ordered:
+        if clip.track_locked or clip.bound_track is None:
+            continue
+        key = str(Path(clip.bound_track))
+        continuity_counts[key] = continuity_counts.get(key, 0) + 1
+
+    def reserve_next_auto_track() -> tuple[Path | None, int]:
+        nonlocal cycle_index, preferred_pending
+        if not pool:
+            return None, cycle_index
+
+        available = [track for track in pool if track not in used_in_cycle]
+        if not available:
+            used_in_cycle.clear()
+            cycle_index += 1
+            available = list(pool)
+
+        if preferred_pending is not None and preferred_pending in available:
+            chosen_track = preferred_pending
+            preferred_pending = None
         else:
-            available = [track for track in pool if track not in used_in_cycle]
-            if not available:
-                used_in_cycle.clear()
-                cycle_index += 1
-                available = list(pool)
-            if preferred_pending is not None and preferred_pending in available:
-                chosen_track = preferred_pending
-                preferred_pending = None
-            else:
-                chosen_track = available[0]
-        bindings[clip.clip_id] = (chosen_track, cycle_index)
-        if chosen_track is not None and chosen_track in pool:
-            used_in_cycle.add(chosen_track)
+            chosen_track = available[0]
+        used_in_cycle.add(chosen_track)
+        return chosen_track, cycle_index
+
+    for clip in ordered:
+        bound_track = Path(clip.bound_track) if clip.bound_track is not None else None
+        if clip.track_locked and bound_track is not None:
+            bindings[clip.clip_id] = (bound_track, cycle_index)
+            if bound_track in pool:
+                used_in_cycle.add(bound_track)
+                if preferred_pending == bound_track:
+                    preferred_pending = None
+            continue
+
+        continuity_key: str | None = None
+        if bound_track is not None and continuity_counts.get(str(bound_track), 0) > 1:
+            continuity_key = str(bound_track)
+
+        if continuity_key is not None and continuity_key in continuity_bindings:
+            bindings[clip.clip_id] = continuity_bindings[continuity_key]
+            continue
+
+        chosen_track, chosen_cycle_index = reserve_next_auto_track()
+        bindings[clip.clip_id] = (chosen_track, chosen_cycle_index)
+        if continuity_key is not None:
+            continuity_bindings[continuity_key] = (chosen_track, chosen_cycle_index)
     return bindings
 
 
@@ -162,7 +193,7 @@ def bind_unassigned_music_clips(clips: list[MusicClip], tracks: list[Path]) -> l
     bindings = resolve_music_track_bindings(clips, tracks)
     bound: list[MusicClip] = []
     for clip in clips:
-        if clip.bound_track is not None:
+        if clip.track_locked and clip.bound_track is not None:
             bound.append(replace(clip))
             continue
         track, _cycle_index = bindings.get(clip.clip_id, (None, 0))
@@ -385,6 +416,7 @@ def _copy_clip_with_range(
             volume=clip.volume,
             source_mode=clip.source_mode,
             bound_track=clip.bound_track,
+            track_locked=clip.track_locked,
             track_offset_sec=max(0.0, round(clip.track_offset_sec + start_delta, 3)),
         )
     return TimelineClip(
@@ -406,6 +438,7 @@ def _normalize_music_clips(clips: list[MusicClip], *, duration: float) -> list[M
             volume=max(0.0, min(2.0, clip.volume)),
             source_mode=clip.source_mode,
             bound_track=clip.bound_track,
+            track_locked=clip.track_locked,
             track_offset_sec=max(0.0, round(clip.track_offset_sec, 3)),
         )
         for clip in normalized
@@ -619,6 +652,7 @@ class RenderedMusicAssignment:
     track_offset_sec: float = 0.0
     source_mode: TimelineSourceMode = "pool"
     cycle_index: int = 0
+    track_locked: bool = False
 
 
 @dataclass(slots=True)

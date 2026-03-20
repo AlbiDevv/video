@@ -319,7 +319,8 @@ class VariationGenerator:
             )
             if mapped is None or not clip.enabled:
                 continue
-            resolved_track, cycle_index = track_bindings.get(clip.clip_id, (clip.bound_track, 0))
+            fallback_track = clip.bound_track if clip.track_locked else None
+            resolved_track, cycle_index = track_bindings.get(clip.clip_id, (fallback_track, 0))
             if resolved_track is not None:
                 resolved_track = Path(resolved_track)
             if resolved_track is None or not resolved_track.exists():
@@ -334,6 +335,7 @@ class VariationGenerator:
                     track_offset_sec=max(0.0, float(clip.track_offset_sec)),
                     source_mode=clip.source_mode,
                     cycle_index=cycle_index,
+                    track_locked=clip.track_locked,
                 )
             )
         return assignments
@@ -350,7 +352,7 @@ class VariationGenerator:
         missing_tracks = [
             clip.bound_track
             for clip in active_clips
-            if clip.bound_track is not None and not Path(clip.bound_track).exists()
+            if clip.track_locked and clip.bound_track is not None and not Path(clip.bound_track).exists()
         ]
         if not timeline_clips:
             return "Музыка: на таймлайне нет music clips."
@@ -362,7 +364,7 @@ class VariationGenerator:
                 "клип станет тишиной."
             )
         if not music_segments:
-            if not music_tracks and not any(clip.bound_track is not None for clip in active_clips):
+            if not music_tracks and not any(clip.track_locked and clip.bound_track is not None for clip in active_clips):
                 return "Музыка: треки не загружены, music assignments пустые."
             return (
                 "Музыка: активные клипы есть, но после trim/speed не осталось "
@@ -902,7 +904,12 @@ class VariationGenerator:
                     )
                 )
                 self.last_summary.success_count += 1
-                self._music_pick_count += len([assignment for assignment in attempt.music_assignments if assignment.track is not None])
+                auto_music_picks = {
+                    (assignment.track, assignment.cycle_index)
+                    for assignment in attempt.music_assignments
+                    if assignment.track is not None and not assignment.track_locked
+                }
+                self._music_pick_count += len(auto_music_picks)
                 if attempt.report.warnings:
                     self.last_summary.warning_count += 1
 

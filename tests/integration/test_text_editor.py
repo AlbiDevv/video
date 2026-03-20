@@ -134,7 +134,7 @@ class TextEditorIntegrationTestCase(unittest.TestCase):
 
         self.assertEqual(len(profile.timeline.music_clips), 1)
         self.assertAlmostEqual(profile.timeline.music_clips[0].start_sec, 1.75, places=2)
-        self.assertEqual(profile.timeline.music_clips[0].bound_track, Path("track_a.mp3"))
+        self.assertIsNone(profile.timeline.music_clips[0].bound_track)
         self.assertEqual(tab._selected_clip_lane, "Music")
         self.assertEqual(tab._selected_clip_id, profile.timeline.music_clips[0].clip_id)
 

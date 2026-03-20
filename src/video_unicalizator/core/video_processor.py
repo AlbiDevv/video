@@ -308,21 +308,11 @@ class VideoProcessor:
         filters: list[str] = []
         source_end = max(profile.trim_start + 0.12, media_info.duration - profile.trim_end)
         speed_pts = 1.0 / max(profile.speed_factor, 0.01)
-        zoom_factor = CROP_FAMILY_ZOOM.get(profile.crop_family, 1.0)
-        scaled_width = max(TARGET_WIDTH, int(round(TARGET_WIDTH * zoom_factor)))
-        scaled_height = max(TARGET_HEIGHT, int(round(TARGET_HEIGHT * zoom_factor)))
-        crop_x = "(in_w-out_w)/2"
-        crop_y = "(in_h-out_h)/2"
-        if profile.crop_anchor == "top":
-            crop_y = "0"
-        elif profile.crop_anchor == "bottom":
-            crop_y = "in_h-out_h"
-
         video_steps = [
             f"trim=start={profile.trim_start:.4f}:end={source_end:.4f}",
             "setpts=PTS-STARTPTS",
-            f"scale={scaled_width}:{scaled_height}:force_original_aspect_ratio=increase",
-            f"crop={TARGET_WIDTH}:{TARGET_HEIGHT}:x={crop_x}:y={crop_y}",
+            f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=increase",
+            f"crop={TARGET_WIDTH}:{TARGET_HEIGHT}:x=(in_w-out_w)/2:y=(in_h-out_h)/2",
             "setsar=1",
             f"setpts={speed_pts:.8f}*PTS",
             f"fps={DEFAULT_FPS}",

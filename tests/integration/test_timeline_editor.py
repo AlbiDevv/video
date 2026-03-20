@@ -136,6 +136,50 @@ class TimelineEditorIntegrationTestCase(unittest.TestCase):
         self.assertEqual([(clip.start_sec, clip.end_sec) for clip in current], [(2.0, 5.0), (5.0, 8.0)])
         self.assertEqual([clip.bound_track for clip in current], [Path("track.mp3"), Path("track.mp3")])
         self.assertEqual([round(clip.track_offset_sec, 2) for clip in current], [3.5, 6.5])
+        self.assertEqual([clip.track_locked for clip in current], [False, False])
+
+    def test_split_music_clip_uses_preview_assignment_for_unlocked_continuity(self) -> None:
+        app = ctk.CTk()
+        self.addCleanup(app.destroy)
+        app.geometry("1500x900")
+
+        widget = TimelineEditorWidget(
+            app,
+            on_timeline_change=lambda _timeline: None,
+            on_playhead_change=lambda _seconds: None,
+            on_lane_focus=lambda _lane: None,
+        )
+        widget.pack(fill="both", expand=True)
+        app.update_idletasks()
+        app.update()
+
+        widget.set_media_sources(video_path=None, music_tracks=[Path("track_a.mp3"), Path("track_b.mp3")])
+        timeline = VideoTimelineProfile(
+            music_clips=[
+                MusicClip(
+                    clip_id="music_clip",
+                    start_sec=1.0,
+                    end_sec=7.0,
+                    volume=0.8,
+                    bound_track=Path("legacy.mp3"),
+                    track_offset_sec=2.5,
+                )
+            ],
+            duration_hint=10.0,
+        )
+        widget.load_timeline(timeline, duration=10.0)
+        widget.set_playhead(4.0, notify=False)
+        widget.select_clip("Music", "music_clip")
+        app.update_idletasks()
+        app.update()
+
+        self.assertTrue(widget.split_selected_clip())
+
+        current = widget.read_timeline().music_clips
+        self.assertEqual([(clip.start_sec, clip.end_sec) for clip in current], [(1.0, 4.0), (4.0, 7.0)])
+        self.assertEqual([clip.bound_track for clip in current], [Path("track_a.mp3"), Path("track_a.mp3")])
+        self.assertEqual([round(clip.track_offset_sec, 2) for clip in current], [2.5, 5.5])
+        self.assertEqual([clip.track_locked for clip in current], [False, False])
 
     def test_split_button_enabled_only_when_playhead_inside_selected_clip(self) -> None:
         app = ctk.CTk()

@@ -26,7 +26,12 @@ from video_unicalizator.state import (
     VideoTimelineProfile,
     bind_unassigned_music_clips,
 )
-from video_unicalizator.ui.preview_support import ThumbnailStripCache, WaveformCache, assign_preview_music_clips
+from video_unicalizator.ui.preview_support import (
+    PreviewMusicAssignment,
+    ThumbnailStripCache,
+    WaveformCache,
+    assign_preview_music_clips,
+)
 
 TimelineChangeCallback = Callable[[VideoTimelineProfile], None]
 LaneFocusCallback = Callable[[TimelineLane], None]
@@ -293,6 +298,12 @@ class TimelineEditorWidget(ctk.CTkFrame):
             self._redraw_tracks_only()
         return True
 
+    def _preview_music_assignment_map(self) -> dict[str, PreviewMusicAssignment]:
+        return {
+            assignment.clip_id: assignment
+            for assignment in assign_preview_music_clips(self._timeline.music_clips, self._music_tracks)
+        }
+
     def load_timeline(self, timeline: VideoTimelineProfile, duration: float) -> None:
         self._timeline = timeline.copy()
         self._duration = max(0.0, duration)
@@ -423,14 +434,22 @@ class TimelineEditorWidget(ctk.CTkFrame):
 
         split_sec = round(self._playhead, 3)
         clips = list(self._clips_for_lane(lane))
+        music_assignments = self._preview_music_assignment_map() if lane == "Music" else {}
         updated: list[TimelineClip] = []
         new_clip_id: str | None = None
         for current in clips:
             if current.clip_id != clip.clip_id:
                 updated.append(current)
                 continue
-            left_clip = replace(current, end_sec=split_sec)
-            right_clip = self._make_split_clip(current, start_sec=split_sec, end_sec=current.end_sec)
+            if isinstance(current, MusicClip) and not current.track_locked:
+                assignment = music_assignments.get(current.clip_id)
+                continuity_track = assignment.track if assignment is not None and assignment.track is not None else current.bound_track
+                split_source = replace(current, bound_track=continuity_track, track_locked=False)
+                left_clip = replace(split_source, end_sec=split_sec)
+                right_clip = self._make_split_clip(split_source, start_sec=split_sec, end_sec=current.end_sec)
+            else:
+                left_clip = replace(current, end_sec=split_sec)
+                right_clip = self._make_split_clip(current, start_sec=split_sec, end_sec=current.end_sec)
             updated.append(left_clip)
             updated.append(right_clip)
             new_clip_id = right_clip.clip_id
@@ -624,10 +643,7 @@ class TimelineEditorWidget(ctk.CTkFrame):
 
     def _draw_tracks(self, full_width: int) -> None:
         visible_left, visible_right = self._visible_canvas_x_bounds()
-        music_assignments = {
-            assignment.clip_id: assignment
-            for assignment in assign_preview_music_clips(self._timeline.music_clips, self._music_tracks)
-        }
+        music_assignments = self._preview_music_assignment_map()
         for lane, title, color in self.LANE_META:
             top = self._lane_top(lane)
             bottom = top + self.TRACK_HEIGHT
@@ -965,6 +981,7 @@ class TimelineEditorWidget(ctk.CTkFrame):
                 volume=clip.volume,
                 source_mode=clip.source_mode,
                 bound_track=clip.bound_track,
+                track_locked=clip.track_locked,
                 track_offset_sec=max(0.0, round(clip.track_offset_sec + start_delta, 3)),
             )
         return TimelineClip(start_sec=start_sec, end_sec=end_sec, enabled=clip.enabled)
@@ -1053,16 +1070,6 @@ class TimelineEditorWidget(ctk.CTkFrame):
             end_sec = self._duration
         if lane == "Music":
             new_clip = MusicClip(start_sec=start_sec, end_sec=end_sec, volume=1.0)
-            if self._music_tracks:
-                preview_binding = bind_unassigned_music_clips([*self._timeline.music_clips, new_clip], self._music_tracks)
-                new_clip = next(
-                    (
-                        clip
-                        for clip in preview_binding
-                        if isinstance(clip, MusicClip) and clip.clip_id == new_clip.clip_id
-                    ),
-                    new_clip,
-                )
         else:
             new_clip = QuoteClip(
                 start_sec=start_sec,

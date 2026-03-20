@@ -33,6 +33,7 @@ class PreviewSupportTestCase(unittest.TestCase):
                 end_sec=2.0,
                 volume=1.0,
                 bound_track=Path("bound.mp3"),
+                track_locked=True,
                 track_offset_sec=4.25,
             ),
             MusicClip(clip_id="c2", start_sec=2.0, end_sec=4.0, volume=1.0),
@@ -43,6 +44,24 @@ class PreviewSupportTestCase(unittest.TestCase):
         self.assertEqual(assignments[0].track, Path("bound.mp3"))
         self.assertAlmostEqual(assignments[0].track_offset_sec, 4.25, places=2)
         self.assertEqual(assignments[1].track, Path("other.mp3"))
+
+    def test_assign_preview_music_clips_ignores_legacy_singleton_bound_track_for_rotation(self) -> None:
+        clips = [
+            MusicClip(
+                clip_id="c1",
+                start_sec=0.0,
+                end_sec=2.0,
+                volume=1.0,
+                bound_track=Path("legacy.mp3"),
+                track_offset_sec=1.5,
+            ),
+            MusicClip(clip_id="c2", start_sec=2.0, end_sec=4.0, volume=1.0),
+        ]
+
+        assignments = assign_preview_music_clips(clips, [Path("other.mp3"), Path("next.mp3")])
+
+        self.assertEqual([item.track for item in assignments], [Path("other.mp3"), Path("next.mp3")])
+        self.assertAlmostEqual(assignments[0].track_offset_sec, 1.5, places=2)
 
     def test_preview_audio_cache_returns_none_without_source_video(self) -> None:
         cache = PreviewAudioCache()

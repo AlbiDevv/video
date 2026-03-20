@@ -49,7 +49,8 @@ def assign_preview_music_clips(clips: list[MusicClip], tracks: list[Path]) -> li
 
     bindings = resolve_music_track_bindings(enabled, tracks)
     for clip in enabled:
-        track, cycle_index = bindings.get(clip.clip_id, (clip.bound_track, 0))
+        fallback_track = clip.bound_track if clip.track_locked else None
+        track, cycle_index = bindings.get(clip.clip_id, (fallback_track, 0))
         assignments.append(
             PreviewMusicAssignment(
                 clip_id=clip.clip_id,

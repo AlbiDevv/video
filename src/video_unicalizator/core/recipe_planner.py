@@ -14,13 +14,6 @@ from video_unicalizator.state import ColorGradeProfile, GenerationSettings
 MIN_RECIPE_DISTANCE = 2.15
 REJECTED_RECIPE_NEIGHBOURHOOD = 1.45
 
-CROP_FAMILY_ZOOM = {
-    "neutral": 1.00,
-    "punch_in": 1.08,
-    "tight_crop": 1.14,
-}
-CROP_ANCHORS = ("center", "top", "bottom")
-
 
 @dataclass(slots=True, frozen=True)
 class VariationRecipe:
@@ -44,12 +37,7 @@ class VariationRecipe:
 
     def short_label(self) -> str:
         track_name = self.music_track.name if self.music_track is not None else "без_музыки"
-        return (
-            f"crop={self.crop_anchor}_{self.crop_family}, "
-            f"preset={self.filter_preset}, "
-            f"duration={self.output_duration:.1f}, "
-            f"track={track_name}"
-        )
+        return f"preset={self.filter_preset}, duration={self.output_duration:.1f}, track={track_name}"
 
 
 @dataclass(slots=True, frozen=True)
@@ -188,10 +176,6 @@ class VariationRecipePlanner:
         score = duration_gap + speed_gap + trim_start_gap + trim_end_gap + contrast_gap + saturation_gap + brightness_gap + accent_gap
         if left.filter_preset != right.filter_preset:
             score += 0.95
-        if left.crop_family != right.crop_family:
-            score += 0.85
-        if left.crop_anchor != right.crop_anchor:
-            score += 0.55
         if left.sharpen_enabled != right.sharpen_enabled:
             score += 0.28
         if left.music_track != right.music_track:
@@ -212,10 +196,6 @@ class VariationRecipePlanner:
             factors.append("trim_end")
         if left.filter_preset == right.filter_preset:
             factors.append("filter")
-        if left.crop_family == right.crop_family:
-            factors.append("crop_family")
-        if left.crop_anchor == right.crop_anchor:
-            factors.append("crop_anchor")
         if left.brightness_variant == right.brightness_variant:
             factors.append("brightness")
         if left.contrast_variant == right.contrast_variant:
@@ -232,8 +212,6 @@ class VariationRecipePlanner:
 
     def _intrinsic_score(self, recipe: VariationRecipe) -> float:
         preset_bonus = list(FILTER_PRESETS).index(recipe.filter_preset) * 0.08
-        crop_bonus = list(CROP_FAMILY_ZOOM).index(recipe.crop_family) * 0.22
-        anchor_bonus = CROP_ANCHORS.index(recipe.crop_anchor) * 0.12
         tone_bonus = (
             abs(recipe.brightness_variant)
             + abs(recipe.contrast_variant)
@@ -243,7 +221,7 @@ class VariationRecipePlanner:
         speed_bonus = abs(recipe.speed_factor - 1.0) * 2.8
         duration_bonus = abs(recipe.output_duration - self.source_duration) * 0.10
         sharpen_bonus = 0.18 if recipe.sharpen_enabled else 0.0
-        return preset_bonus + crop_bonus + anchor_bonus + tone_bonus + speed_bonus + duration_bonus + sharpen_bonus
+        return preset_bonus + tone_bonus + speed_bonus + duration_bonus + sharpen_bonus
 
     def _sample_candidates(self, music_choice: MusicChoice) -> list[VariationRecipe]:
         self._sample_round += 1
@@ -283,8 +261,6 @@ class VariationRecipePlanner:
         contrast_variant = self._rng.choice((-1, 0, 1))
         saturation_variant = self._rng.choice((-1, 0, 1))
         accent_strength_variant = self._rng.choice((-1, 0, 1))
-        crop_family = self._rng.choice(tuple(CROP_FAMILY_ZOOM))
-        crop_anchor = self._rng.choice(CROP_ANCHORS)
         sharpen_enabled = bool(self.settings.enhance_sharpness and self._rng.choice((0, 1)))
         return self._build_recipe(
             speed_factor=speed_factor,
@@ -297,8 +273,8 @@ class VariationRecipePlanner:
             contrast_variant=contrast_variant,
             saturation_variant=saturation_variant,
             accent_strength_variant=accent_strength_variant,
-            crop_family=crop_family,
-            crop_anchor=crop_anchor,
+            crop_family="neutral",
+            crop_anchor="center",
             sharpen_enabled=sharpen_enabled,
             music_choice=music_choice,
         )
@@ -360,8 +336,6 @@ class VariationRecipePlanner:
             contrast_variant,
             saturation_variant,
             accent_strength_variant,
-            crop_family,
-            crop_anchor,
             int(sharpen_enabled),
         )
         recipe_key = "|".join(
@@ -375,8 +349,6 @@ class VariationRecipePlanner:
                 str(contrast_variant),
                 str(saturation_variant),
                 str(accent_strength_variant),
-                crop_family,
-                crop_anchor,
                 "sh1" if sharpen_enabled else "sh0",
                 music_name,
                 f"cycle{music_choice.cycle_index}",
