@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -20,13 +21,20 @@ from video_unicalizator.config import (
 from video_unicalizator.core.text_overlay import OverlayLayout, TextOverlayRenderer
 from video_unicalizator.state import (
     ColorGradeProfile,
+    ExportMetadataPolicy,
+    ExportMetadataReport,
     GenerationCancelToken,
     GenerationCancelledError,
     RenderedMusicAssignment,
     RenderedQuoteAssignment,
     TextStyle,
 )
-from video_unicalizator.utils.ffmpeg_tools import ensure_ffmpeg_environment, parse_ffmpeg_progress_time, probe_media
+from video_unicalizator.utils.ffmpeg_tools import (
+    ensure_ffmpeg_environment,
+    parse_ffmpeg_progress_time,
+    probe_export_metadata,
+    probe_media,
+)
 from video_unicalizator.utils.temp_paths import project_temporary_directory
 
 RenderProgressCallback = Callable[[float, float | None, float | None, float | None], None]
@@ -168,16 +176,23 @@ class VideoProcessor:
         music_segments: Sequence[RenderedMusicAssignment],
         profile: VariationProfile,
         music_volume: float,
+        metadata_policy: ExportMetadataPolicy = "safe_normalize",
         progress_callback: RenderProgressCallback | None = None,
         enhance_sharpness: bool = False,
         cancel_token: GenerationCancelToken | None = None,
-    ) -> VariationProfile:
+    ) -> ExportMetadataReport:
         media_info = probe_media(source_video)
         if media_info.duration <= 0:
             raise RuntimeError(f"Не удалось определить длительность видео: {source_video.name}")
 
         output_video.parent.mkdir(parents=True, exist_ok=True)
         ffmpeg_path, _ = ensure_ffmpeg_environment()
+        creation_time = self._utc_creation_time()
+        metadata_report = ExportMetadataReport(
+            policy=metadata_policy,
+            creation_time=creation_time,
+            verification_note="pending",
+        )
         if not ffmpeg_path:
             raise RuntimeError("ffmpeg не найден.")
 
@@ -190,12 +205,14 @@ class VideoProcessor:
                 music_segments=music_segments,
                 music_volume=music_volume,
                 output_video=output_video,
+                metadata_policy=metadata_policy,
+                creation_time=creation_time,
                 profile=profile,
                 media_info=media_info,
                 enhance_sharpness=enhance_sharpness,
             )
             self._run_ffmpeg(command, output_video, profile.output_duration, progress_callback, cancel_token)
-        return profile
+        return self._verify_export_metadata(output_video, metadata_report)
 
     def _build_overlay_inputs(
         self,
@@ -228,6 +245,8 @@ class VideoProcessor:
         music_segments: Sequence[RenderedMusicAssignment],
         music_volume: float,
         output_video: Path,
+        metadata_policy: ExportMetadataPolicy,
+        creation_time: str,
         profile: VariationProfile,
         media_info,
         enhance_sharpness: bool,
@@ -272,6 +291,7 @@ class VideoProcessor:
             command.extend(["-map", f"[{audio_label}]", "-c:a", DEFAULT_AUDIO_CODEC])
         else:
             command.append("-an")
+        command.extend(self._build_safe_export_args(metadata_policy=metadata_policy, creation_time=creation_time))
 
         command.extend(
             [
@@ -294,6 +314,58 @@ class VideoProcessor:
             ]
         )
         return command
+
+    def _utc_creation_time(self) -> str:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _build_safe_export_args(
+        self,
+        *,
+        metadata_policy: ExportMetadataPolicy,
+        creation_time: str,
+    ) -> list[str]:
+        if metadata_policy != "safe_normalize":
+            return []
+        return [
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-metadata",
+            f"creation_time={creation_time}",
+        ]
+
+    def _verify_export_metadata(
+        self,
+        output_video: Path,
+        report: ExportMetadataReport,
+    ) -> ExportMetadataReport:
+        if report.policy != "safe_normalize":
+            return report
+        try:
+            probe = probe_export_metadata(output_video)
+        except RuntimeError as error:
+            return replace(report, verification_note=str(error))
+        except Exception as error:  # noqa: BLE001
+            return replace(report, verification_note=f"metadata probe failed: {error}")
+
+        retained_tags = {
+            key: value
+            for key, value in probe.format_tags.items()
+            if key.lower() != "creation_time"
+        }
+        return replace(
+            report,
+            metadata_stripped=not retained_tags,
+            chapters_stripped=probe.chapter_count == 0,
+            creation_time=probe.creation_time or report.creation_time,
+            format_name=probe.format_name,
+            duration_seconds=probe.duration,
+            video_codec=probe.video_codec,
+            audio_codec=probe.audio_codec,
+            has_format_tags=bool(probe.format_tags),
+            verification_note="ok",
+        )
 
     def _build_filter_complex(
         self,

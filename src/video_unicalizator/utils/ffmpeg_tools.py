@@ -18,6 +18,17 @@ class MediaProbeInfo:
     has_audio: bool
 
 
+@dataclass(slots=True)
+class ExportMetadataProbeInfo:
+    format_name: str
+    duration: float
+    video_codec: str
+    audio_codec: str
+    creation_time: str
+    format_tags: dict[str, str]
+    chapter_count: int
+
+
 def no_window_creationflags() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -106,6 +117,16 @@ def probe_media(video_path: Path) -> MediaProbeInfo:
     return _probe_media_cached(str(resolved), stat.st_mtime_ns, stat.st_size, ffprobe_path)
 
 
+def probe_export_metadata(video_path: Path) -> ExportMetadataProbeInfo:
+    _, ffprobe_path = ensure_ffmpeg_environment()
+    if not ffprobe_path:
+        raise RuntimeError("ffprobe не найден.")
+
+    resolved = video_path.resolve()
+    stat = resolved.stat()
+    return _probe_export_metadata_cached(str(resolved), stat.st_mtime_ns, stat.st_size, ffprobe_path)
+
+
 @lru_cache(maxsize=256)
 def _probe_media_cached(video_path: str, _mtime_ns: int, _size: int, ffprobe_path: str) -> MediaProbeInfo:
     command = [
@@ -143,6 +164,59 @@ def _probe_media_cached(video_path: str, _mtime_ns: int, _size: int, ffprobe_pat
         duration=max(0.0, duration),
         fps=fps,
         has_audio=audio_stream is not None,
+    )
+
+
+@lru_cache(maxsize=256)
+def _probe_export_metadata_cached(
+    video_path: str,
+    _mtime_ns: int,
+    _size: int,
+    ffprobe_path: str,
+) -> ExportMetadataProbeInfo:
+    command = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-show_streams",
+        "-show_format",
+        "-show_chapters",
+        "-of",
+        "json",
+        video_path,
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=True,
+        creationflags=no_window_creationflags(),
+    )
+    payload = json.loads(completed.stdout or "{}")
+
+    streams = payload.get("streams", [])
+    format_payload = payload.get("format", {})
+    chapters = payload.get("chapters", [])
+    video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+    audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), {})
+    format_tags = {
+        str(key): str(value)
+        for key, value in (format_payload.get("tags") or {}).items()
+        if value is not None
+    }
+    creation_time = str(format_tags.get("creation_time") or "")
+    if not creation_time:
+        stream_tags = video_stream.get("tags") or {}
+        creation_time = str(stream_tags.get("creation_time") or "")
+
+    return ExportMetadataProbeInfo(
+        format_name=str(format_payload.get("format_name") or ""),
+        duration=max(0.0, float(format_payload.get("duration") or 0.0)),
+        video_codec=str(video_stream.get("codec_name") or ""),
+        audio_codec=str(audio_stream.get("codec_name") or ""),
+        creation_time=creation_time,
+        format_tags=format_tags,
+        chapter_count=len(chapters),
     )
 
 

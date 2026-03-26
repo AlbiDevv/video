@@ -52,6 +52,42 @@ class FfmpegToolsTestCase(unittest.TestCase):
                 ffmpeg_tools.no_window_creationflags(),
             )
 
+    def test_probe_export_metadata_parses_tags_and_chapters(self) -> None:
+        with project_temporary_directory(prefix="test_ffmpeg_", subdir="tests") as tmpdir:
+            media_path = tmpdir / "sample.mp4"
+            media_path.write_bytes(b"fake")
+            payload = {
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "tags": {"creation_time": "2026-03-26T12:00:00Z"},
+                    },
+                    {"codec_type": "audio", "codec_name": "aac"},
+                ],
+                "format": {
+                    "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+                    "duration": "5.0",
+                    "tags": {"creation_time": "2026-03-26T12:00:00Z", "encoder": "Lavf"},
+                },
+                "chapters": [{"id": 0}],
+            }
+            completed = Mock(stdout=json.dumps(payload))
+
+            with patch.object(ffmpeg_tools, "ensure_ffmpeg_environment", return_value=("ffmpeg", "ffprobe")), patch(
+                "video_unicalizator.utils.ffmpeg_tools.subprocess.run",
+                return_value=completed,
+            ) as run_mock:
+                probe = ffmpeg_tools.probe_export_metadata(media_path)
+
+            self.assertEqual(run_mock.call_count, 1)
+            self.assertEqual(probe.format_name, "mov,mp4,m4a,3gp,3g2,mj2")
+            self.assertEqual(probe.video_codec, "h264")
+            self.assertEqual(probe.audio_codec, "aac")
+            self.assertEqual(probe.creation_time, "2026-03-26T12:00:00Z")
+            self.assertEqual(probe.chapter_count, 1)
+            self.assertEqual(probe.format_tags["encoder"], "Lavf")
+
 
 if __name__ == "__main__":
     unittest.main()

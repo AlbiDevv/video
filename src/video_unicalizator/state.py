@@ -31,6 +31,7 @@ from video_unicalizator.paths import OUTPUT_DIR
 LayerKey = Literal["A", "B"]
 TimelineLane = Literal["A", "B", "Music"]
 TimelineSourceMode = Literal["pool", "sample"]
+ExportMetadataPolicy = Literal["safe_normalize"]
 
 
 def _clip_id(prefix: str) -> str:
@@ -534,6 +535,7 @@ class GenerationSettings:
 
     variation_count: int = DEFAULT_VARIATIONS
     music_volume: float = MUSIC_VOLUME
+    metadata_policy: ExportMetadataPolicy = "safe_normalize"
     apply_text_style_to_all: bool = True
     enforce_quality_gate: bool = True
     quality_gate_mode: Literal["soft", "strict", "off"] = "soft"
@@ -656,6 +658,22 @@ class RenderedMusicAssignment:
 
 
 @dataclass(slots=True)
+class ExportMetadataReport:
+    """Краткий diagnostic итогового контейнера и metadata-политики export."""
+
+    policy: ExportMetadataPolicy = "safe_normalize"
+    metadata_stripped: bool = False
+    chapters_stripped: bool = False
+    creation_time: str = ""
+    format_name: str = ""
+    duration_seconds: float = 0.0
+    video_codec: str = ""
+    audio_codec: str = ""
+    has_format_tags: bool | None = None
+    verification_note: str = ""
+
+
+@dataclass(slots=True)
 class GeneratedVariation:
     """Описание одного сгенерированного ролика."""
 
@@ -683,6 +701,7 @@ class GeneratedVariation:
     nearest_distance_score: float | None = None
     quote_assignments: list[RenderedQuoteAssignment] = field(default_factory=list)
     music_assignments: list[RenderedMusicAssignment] = field(default_factory=list)
+    export_metadata: ExportMetadataReport = field(default_factory=ExportMetadataReport)
 
 
 @dataclass(slots=True)

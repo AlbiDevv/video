@@ -45,6 +45,8 @@ class VideoProcessorTestCase(unittest.TestCase):
             music_segments=[assignment],
             music_volume=1.2,
             output_video=Path("out.mp4"),
+            metadata_policy="safe_normalize",
+            creation_time="2026-03-26T12:00:00Z",
             profile=self.profile,
             media_info=MediaProbeInfo(width=1080, height=1920, duration=6.0, fps=30.0, has_audio=True),
             enhance_sharpness=False,
@@ -57,6 +59,12 @@ class VideoProcessorTestCase(unittest.TestCase):
         self.assertIn("[music0]anull[musicbus]", filter_complex)
         self.assertIn("[voice][musicbus]amix=inputs=2:normalize=0:duration=longest[aout]", filter_complex)
         self.assertIn("[aout]", command)
+        self.assertIn("-map_metadata", command)
+        self.assertIn("-map_chapters", command)
+        self.assertIn("creation_time=2026-03-26T12:00:00Z", command)
+        self.assertNotIn("title=", " ".join(command))
+        self.assertNotIn("comment=", " ".join(command))
+        self.assertNotIn("artist=", " ".join(command))
 
     def test_build_filter_complex_uses_music_bus_without_source_audio(self) -> None:
         assignment = RenderedMusicAssignment(

@@ -19,6 +19,7 @@ from video_unicalizator.core.variation_generator import (
 from video_unicalizator.core.video_processor import VariationProfile
 from video_unicalizator.state import (
     AppState,
+    ExportMetadataReport,
     GenerationCancelToken,
     MusicClip,
     QuoteClip,
@@ -100,6 +101,62 @@ class VariationGeneratorTestCase(unittest.TestCase):
         self.assertEqual(len(generated), 1)
         self.assertEqual(generator.last_summary.failed_count, 1)
         self.assertEqual(generator.last_summary.success_count, 1)
+
+    def test_generate_carries_export_metadata_into_result(self) -> None:
+        state = AppState()
+        state.media.original_videos = [Path("source.mp4")]
+        state.generation.variation_count = 1
+
+        generator = VariationGenerator()
+        attempt = RenderAttempt(
+            output_video=Path("output_ok.mp4"),
+            profile=VariationProfile(
+                speed_factor=1.0,
+                brightness_shift=0.0,
+                contrast_shift=0.0,
+                saturation_shift=0.0,
+                filter_preset="neutral_contrast",
+                trim_start=0.0,
+                trim_end=0.0,
+                output_duration=5.2,
+                target_duration=5.2,
+            ),
+            report=QualityReport(
+                sharpness_score=100.0,
+                visual_difference_score=10.0,
+                format_ok=True,
+                duration_seconds=5.2,
+                duration_unique=True,
+                warnings=[],
+            ),
+            primary_quote="quote A",
+            secondary_quote="quote B",
+            music_track=None,
+            snapshot=None,
+            export_metadata=ExportMetadataReport(
+                policy="safe_normalize",
+                metadata_stripped=True,
+                chapters_stripped=True,
+                creation_time="2026-03-26T12:00:00Z",
+                format_name="mov,mp4,m4a,3gp,3g2,mj2",
+                video_codec="h264",
+                audio_codec="aac",
+                has_format_tags=True,
+                verification_note="ok",
+            ),
+        )
+
+        with (
+            patch.object(generator, "_validate_state", return_value=None),
+            patch.object(generator.quality_checker, "inspect_video", return_value=(1080, 1920, 6.0)),
+            patch.object(generator, "_render_with_quality_gate", return_value=attempt),
+        ):
+            generated = generator.generate(state)
+
+        self.assertEqual(len(generated), 1)
+        self.assertEqual(generated[0].export_metadata.policy, "safe_normalize")
+        self.assertTrue(generated[0].export_metadata.metadata_stripped)
+        self.assertEqual(generated[0].export_metadata.creation_time, "2026-03-26T12:00:00Z")
 
     def test_generate_stops_after_cancel_request(self) -> None:
         state = AppState()

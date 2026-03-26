@@ -16,6 +16,7 @@ from video_unicalizator.core.video_processor import QuoteRenderSegment, Variatio
 from video_unicalizator.services.music_loader import MusicChoice, MusicRotation, QuoteChoice, QuoteRotation
 from video_unicalizator.state import (
     AppState,
+    ExportMetadataReport,
     GeneratedVariation,
     GenerationCancelToken,
     GenerationCancelledError,
@@ -58,6 +59,7 @@ class RenderAttempt:
     music_master_volume: float = 1.0
     quote_assignments: list[RenderedQuoteAssignment] = field(default_factory=list)
     music_assignments: list[RenderedMusicAssignment] = field(default_factory=list)
+    export_metadata: ExportMetadataReport = field(default_factory=ExportMetadataReport)
     soft_accepted: bool = False
 
 
@@ -377,6 +379,26 @@ class VariationGenerator:
             f"offset {music_segments[0].track_offset_sec:.2f}s."
         )
 
+    def _metadata_policy_message(self, settings: GenerationSettings) -> str:
+        if settings.metadata_policy != "safe_normalize":
+            return f"Metadata export: policy {settings.metadata_policy}."
+        return (
+            "Metadata export: safe_normalize, source metadata inherited=no, "
+            "chapters inherited=no, creation_time regenerated=yes."
+        )
+
+    def _metadata_verification_message(self, report: ExportMetadataReport) -> str:
+        if report.verification_note and report.verification_note != "ok":
+            return f"Metadata export: verification skipped ({report.verification_note})."
+        codec_summary = "/".join(part for part in (report.video_codec, report.audio_codec) if part) or "unknown"
+        tags_state = "yes" if report.has_format_tags else "no"
+        return (
+            f"Metadata export: policy {report.policy}, stripped={'yes' if report.metadata_stripped else 'no'}, "
+            f"chapters_stripped={'yes' if report.chapters_stripped else 'no'}, "
+            f"creation_time={report.creation_time or 'n/a'}, format={report.format_name or 'n/a'}, "
+            f"codecs={codec_summary}, format_tags={tags_state}."
+        )
+
     def _warning_reason_codes(self, warnings: list[str]) -> list[str]:
         codes: list[str] = []
         for warning in warnings:
@@ -497,6 +519,13 @@ class VariationGenerator:
                 progress_start,
                 current_file=source_video.name,
             )
+            self._notify(
+                callback,
+                "Export metadata",
+                self._metadata_policy_message(state.generation),
+                progress_start,
+                current_file=source_video.name,
+            )
             primary_quote = next(
                 (segment.assignment.text for segment in quote_segments if segment.assignment.lane == "A"),
                 "",
@@ -568,13 +597,14 @@ class VariationGenerator:
                 )
 
             try:
-                self.video_processor.render_variation(
+                export_metadata = self.video_processor.render_variation(
                     source_video=source_video,
                     output_video=attempt_output,
                     quote_segments=quote_segments,
                     music_segments=music_segments,
                     profile=variation_profile,
                     music_volume=state.generation.music_volume,
+                    metadata_policy=state.generation.metadata_policy,
                     progress_callback=on_render_progress,
                     enhance_sharpness=state.generation.enhance_sharpness,
                     cancel_token=cancel_token,
@@ -594,6 +624,14 @@ class VariationGenerator:
                     current_file=source_video.name,
                 )
                 continue
+
+            self._notify(
+                callback,
+                "Export metadata",
+                self._metadata_verification_message(export_metadata),
+                min(0.99, progress_start + progress_step * 0.845),
+                current_file=attempt_output.name,
+            )
 
             if quality_mode == "off":
                 final_path = self._finalize_output(attempt_output, final_output)
@@ -616,6 +654,7 @@ class VariationGenerator:
                     snapshot=None,
                     quote_assignments=[replace(segment.assignment) for segment in quote_segments],
                     music_assignments=[replace(segment) for segment in music_segments],
+                    export_metadata=replace(export_metadata),
                 )
 
             def on_quality_progress(message: str, progress_ratio: float) -> None:
@@ -656,6 +695,7 @@ class VariationGenerator:
                     snapshot=snapshot,
                     quote_assignments=[replace(segment.assignment) for segment in quote_segments],
                     music_assignments=[replace(segment) for segment in music_segments],
+                    export_metadata=replace(export_metadata),
                 )
 
             attempt_output.unlink(missing_ok=True)
@@ -901,6 +941,7 @@ class VariationGenerator:
                         nearest_distance_score=attempt.report.nearest_distance_score,
                         quote_assignments=[replace(assignment) for assignment in attempt.quote_assignments],
                         music_assignments=[replace(assignment) for assignment in attempt.music_assignments],
+                        export_metadata=replace(attempt.export_metadata),
                     )
                 )
                 self.last_summary.success_count += 1
