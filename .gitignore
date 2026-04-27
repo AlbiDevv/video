@@ -16,6 +16,12 @@ tmp_*/
 *.mp3
 *.wav
 *.mov
+.env
+.env.*
+!.env.example
+api_key.txt
+cookies.txt
+secrets.yaml
 output/variations/*
 output/schedules/*
 output/logs/*
